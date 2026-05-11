@@ -57,24 +57,46 @@ def register_backend() -> None:
     _patch_disable_boundary_protection()
 
 
-def _patch_disable_boundary_protection() -> None:
-    """Disable vLLM's auto-add of boundary-protection skip layers.
+def _boundary_protect_enabled() -> bool:
+    """Read `TURBOQUANT_BOUNDARY_PROTECT` env var. Default: enabled (ON).
 
-    vLLM's `EngineArgs.create_engine_config` calls
-    `TurboQuantConfig.get_boundary_skip_layers(num_layers)` when
-    `kv_cache_dtype.startswith("turboquant_")` and merges the result into
-    `cache_config.kv_cache_dtype_skip_layers`. Those skip layers then have
-    `kv_cache_dtype="auto"`, which forced us to keep a slow raw fp16
-    fallback path in the backend (for the case where
-    `attention_backend="TURBOQUANT"` is set explicitly — common for Gemma 4
-    which has heterogeneous head_dims and where vLLM otherwise forces
-    TRITON_ATTN, killing TQ support).
+    ON  (default, or any value other than 0/false/off/no): vLLM auto-adds
+        the first/last 2 attention layers to `kv_cache_dtype_skip_layers`,
+        forcing them to use `kv_cache_dtype="auto"` (raw fp16). Our
+        backend falls those through to a plain SDPA path. Slower per-step
+        but recovers Planar / Rotor accuracy — those rotations collapse
+        to 0% on GSM-8K without it. RHT keeps 100% either way.
 
-    Patching this to return `[]` means every attention layer uses the
-    configured `turboquant_*` cache dtype, so every layer hits our fast
-    Triton path. Accuracy parity (vs the stock 4-layer boundary skip)
-    is verified on GSM-8K (Gemma 4 31B-it).
+    OFF (`TURBOQUANT_BOUNDARY_PROTECT=0`): the plugin overrides
+        `TurboQuantConfig.get_boundary_skip_layers` to return `[]`, so
+        every layer uses the configured `turboquant_*` cache dtype and
+        goes through our fast Triton path. Faster, but Planar / Rotor
+        collapse on Gemma 4 / GSM-8K.
+
+    For production RHT, OFF is fine and faster. For Planar / Rotor,
+    keep ON (the default). The boundary protection itself was
+    introduced by vLLM upstream for accuracy parity with native
+    TurboQuant — disabling it is a fused-turboquant-specific opt-out.
     """
+    import os
+
+    val = os.environ.get("TURBOQUANT_BOUNDARY_PROTECT", "1")
+    return val.lower() not in ("0", "false", "off", "no")
+
+
+def _patch_disable_boundary_protection() -> None:
+    """When `TURBOQUANT_BOUNDARY_PROTECT=0`, override
+    `TurboQuantConfig.get_boundary_skip_layers` to return `[]`.
+    Otherwise no-op (boundary protection stays at vLLM's default ON).
+    Idempotent."""
+    if _boundary_protect_enabled():
+        logger.info(
+            "fused-turboquant: TQ boundary protection ENABLED (default). "
+            "Set TURBOQUANT_BOUNDARY_PROTECT=0 to disable and let every "
+            "layer go through the fast Triton path."
+        )
+        return
+
     try:
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -96,9 +118,9 @@ def _patch_disable_boundary_protection() -> None:
     patched._ft_patched = True
     TurboQuantConfig.get_boundary_skip_layers = staticmethod(patched)
     logger.info(
-        "fused-turboquant: disabled TQ boundary protection — every layer "
-        "will use the configured turboquant_* cache dtype, all going "
-        "through our fast Triton path"
+        "fused-turboquant: TQ boundary protection DISABLED — every layer "
+        "uses the configured turboquant_* cache dtype, all going through "
+        "our fast Triton path."
     )
 
 
