@@ -517,14 +517,36 @@ def make_fused_attention_forward(
             # Prefill path: use Flash/SDPA on full FP16 keys and values to
             # avoid O(n^2) memory. KV are already compressed and stored above
             # for subsequent decode steps.
+            #
+            # If the caller passed an explicit attention_mask (Gemma 4 always
+            # does — it builds a per-layer-type causal/sliding-window mask in
+            # the model's forward), feed that to SDPA verbatim. Otherwise fall
+            # back to the plain causal heuristic.
             full_keys_expanded = _repeat_kv(key_states, n_kv_groups)
             full_values_expanded = _repeat_kv(value_states, n_kv_groups)
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                full_keys_expanded,
-                full_values_expanded,
-                is_causal=True,
-            )
+            # Match the reference SDPA call site: pass `scale` explicitly so
+            # models like Gemma 4 (which set module.scaling=1.0 because Q/K
+            # are already RMS-normalised) don't get silently re-scaled by
+            # SDPA's default 1/sqrt(head_dim).
+            if attention_mask is not None and attention_mask.dim() == 4:
+                kv_len_pf = full_keys_expanded.shape[2]
+                attn_mask_pf = attention_mask[:, :, :q_len, :kv_len_pf]
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    full_keys_expanded,
+                    full_values_expanded,
+                    attn_mask=attn_mask_pf,
+                    scale=scale,
+                    is_causal=False,
+                )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    full_keys_expanded,
+                    full_values_expanded,
+                    scale=scale,
+                    is_causal=True,
+                )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
