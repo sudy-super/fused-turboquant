@@ -54,6 +54,52 @@ def register_backend() -> None:
 
     _patch_attention_get_kv_cache_spec()
     _patch_unify_page_size()
+    _patch_disable_boundary_protection()
+
+
+def _patch_disable_boundary_protection() -> None:
+    """Disable vLLM's auto-add of boundary-protection skip layers.
+
+    vLLM's `EngineArgs.create_engine_config` calls
+    `TurboQuantConfig.get_boundary_skip_layers(num_layers)` when
+    `kv_cache_dtype.startswith("turboquant_")` and merges the result into
+    `cache_config.kv_cache_dtype_skip_layers`. Those skip layers then have
+    `kv_cache_dtype="auto"`, which forced us to keep a slow raw fp16
+    fallback path in the backend (for the case where
+    `attention_backend="TURBOQUANT"` is set explicitly — common for Gemma 4
+    which has heterogeneous head_dims and where vLLM otherwise forces
+    TRITON_ATTN, killing TQ support).
+
+    Patching this to return `[]` means every attention layer uses the
+    configured `turboquant_*` cache dtype, so every layer hits our fast
+    Triton path. Accuracy parity (vs the stock 4-layer boundary skip)
+    is verified on GSM-8K (Gemma 4 31B-it).
+    """
+    try:
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            TurboQuantConfig,
+        )
+    except ImportError:
+        return
+
+    current = TurboQuantConfig.__dict__.get("get_boundary_skip_layers")
+    if current is not None and getattr(
+        current.__func__ if hasattr(current, "__func__") else current,
+        "_ft_patched",
+        False,
+    ):
+        return
+
+    def patched(num_layers, n=2):
+        return []
+
+    patched._ft_patched = True
+    TurboQuantConfig.get_boundary_skip_layers = staticmethod(patched)
+    logger.info(
+        "fused-turboquant: disabled TQ boundary protection — every layer "
+        "will use the configured turboquant_* cache dtype, all going "
+        "through our fast Triton path"
+    )
 
 
 def _patch_attention_get_kv_cache_spec() -> None:
