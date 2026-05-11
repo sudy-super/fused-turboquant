@@ -26,8 +26,25 @@ from fused_turboquant.vllm_plugin.cache_ops import (
 
 logger = logging.getLogger(__name__)
 
-_TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
-_TURBOQUANT_COMPRESS_V = os.environ.get("TURBOQUANT_COMPRESS_V", "1") == "1"
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return int(raw) if raw else default
+
+
+def _env_opt_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    return int(raw) if raw else None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw == "1"
+
+
+def _env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default)
 
 _AttentionImplBase: Type = object
 try:
@@ -92,36 +109,81 @@ class FusedTurboQuantImpl(_AttentionImplBase):
                 "Use a model with RoPE or a different backend."
             )
 
-        self.bits = _TURBOQUANT_BITS
-        self.compress_v = _TURBOQUANT_COMPRESS_V
+        self.bits = _env_int("TURBOQUANT_BITS", 4)
+        v_bits_opt = _env_opt_int("TURBOQUANT_V_BITS")
+        self.v_bits = v_bits_opt if v_bits_opt is not None else self.bits
+        self.compress_v = _env_bool("TURBOQUANT_COMPRESS_V", True)
+        self.kind = _env_str("TURBOQUANT_KIND", "rht")
+        if self.kind not in ("rht", "planar"):
+            raise ValueError(
+                f"TURBOQUANT_KIND must be 'rht' or 'planar', got {self.kind!r}"
+            )
 
-        self.tq = TurboQuantMSE(
+        if self.kind == "rht":
+            QuantizerCls = TurboQuantMSE
+        else:
+            from fused_turboquant.core.planar import PlanarQuantMSE
+            QuantizerCls = PlanarQuantMSE
+
+        self.tq = QuantizerCls(
             head_dim=head_size,
             bits=self.bits,
             device="cuda",
         )
-        self.rht_signs = self.tq.rotation.signs
+        if self.v_bits == self.bits:
+            self.tq_v = self.tq
+        else:
+            self.tq_v = QuantizerCls(
+                head_dim=head_size,
+                bits=self.v_bits,
+                device="cuda",
+            )
+
+        # The K rotation state is what gets folded into Q at decode time. For
+        # mixed-precision K/V we still rotate Q with K's basis (V is decoded to
+        # the original space before the softmax @ V matmul, so V's quantizer
+        # only affects reconstruction, not the QK score path).
+        if self.kind == "rht":
+            self.rotation_state = self.tq.rotation.signs
+        else:
+            self.rotation_state = self.tq.rotation.rot2
         self.centroids = self.tq.quantizer.levels
+        self.centroids_v = self.tq_v.quantizer.levels
         self.boundaries = self.tq.quantizer.boundaries
 
-        if self.bits == 4:
-            self.packed_dim = head_size // 2
-        elif self.bits == 3:
-            self.packed_dim = head_size * 3 // 8
-        elif self.bits == 2:
-            self.packed_dim = head_size // 4
-        else:
-            raise ValueError(f"bits must be 2, 3, or 4, got {self.bits}")
+        def _packed_dim(b: int) -> int:
+            if b == 4:
+                return head_size // 2
+            if b == 3:
+                return head_size * 3 // 8
+            if b == 2:
+                return head_size // 4
+            raise ValueError(f"bits must be 2, 3, or 4, got {b}")
 
-        self.compressed_elem_size = self.packed_dim + 4
+        self.packed_dim = _packed_dim(self.bits)  # K side
+        self.packed_dim_v = _packed_dim(self.v_bits)  # V side
 
+        # Cache layout: each element is max(K, V) packed bytes + 4 bytes for
+        # the fp32 norm. For mixed K/V we still need a single slot size, so we
+        # use the wider of the two packings (the narrower side just doesn't use
+        # the trailing bytes). This keeps the paged-block geometry unchanged.
+        max_packed = max(self.packed_dim, self.packed_dim_v)
+        self.compressed_elem_size = max_packed + 4
+
+        bits_summary = (
+            f"{self.bits}-bit"
+            if self.v_bits == self.bits
+            else f"K={self.bits}-bit V={self.v_bits}-bit"
+        )
         logger.info(
-            "FusedTurboQuantImpl: layer initialized with %d-bit K%s compression, "
-            "head_size=%d, packed_dim=%d, compressed_elem=%d bytes",
-            self.bits,
+            "FusedTurboQuantImpl: layer initialized with %s K%s compression "
+            "(kind=%s, head_size=%d, K_packed=%d, V_packed=%d, elem=%d bytes)",
+            bits_summary,
             "+V" if self.compress_v else "-only",
+            self.kind,
             head_size,
             self.packed_dim,
+            self.packed_dim_v,
             self.compressed_elem_size,
         )
 
@@ -148,7 +210,7 @@ class FusedTurboQuantImpl(_AttentionImplBase):
         k_norms = k_compressed.norms  # [num_tokens, num_kv_heads]
 
         if self.compress_v:
-            v_compressed = self.tq.encode(value_states.float())
+            v_compressed = self.tq_v.encode(value_states.float())
             v_packed = v_compressed.indices
             v_norms = v_compressed.norms
 
@@ -173,7 +235,7 @@ class FusedTurboQuantImpl(_AttentionImplBase):
             kv_cache[0, block_idx, offset, :, self.packed_dim : self.packed_dim + 4] = k_norm_bytes
 
             if self.compress_v:
-                kv_cache[1, block_idx, offset, :, : self.packed_dim] = v_packed[i]
+                kv_cache[1, block_idx, offset, :, : self.packed_dim_v] = v_packed[i]
                 v_norm_bytes = (
                     v_norms[i]
                     .float()
@@ -184,8 +246,8 @@ class FusedTurboQuantImpl(_AttentionImplBase):
                         4,
                     )
                 )
-                norm_end = self.packed_dim + 4
-                kv_cache[1, block_idx, offset, :, self.packed_dim : norm_end] = v_norm_bytes
+                norm_end = self.packed_dim_v + 4
+                kv_cache[1, block_idx, offset, :, self.packed_dim_v : norm_end] = v_norm_bytes
             else:
                 v_bytes = value_states[i].contiguous().half().view(torch.uint8)
                 v_bytes = v_bytes.reshape(self.num_kv_heads, self.head_size * 2)
@@ -221,7 +283,7 @@ class FusedTurboQuantImpl(_AttentionImplBase):
             block_tables,
             seq_lens_tensor,
             kv_type=1,
-            packed_dim=self.packed_dim,
+            packed_dim=self.packed_dim_v,
             max_seq_len=max_seq_len,
         )
 
@@ -229,9 +291,9 @@ class FusedTurboQuantImpl(_AttentionImplBase):
             indices=v_packed,
             norms=v_norms,
             original_dim=self.head_size,
-            bits=self.bits,
+            bits=self.v_bits,
         )
-        decoded_v = self.tq.decode(ct)
+        decoded_v = self.tq_v.decode(ct)
         return decoded_v
 
     def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
@@ -337,7 +399,7 @@ class FusedTurboQuantImpl(_AttentionImplBase):
             k = self._repeat_kv(k)
             v = self._repeat_kv(v)
 
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)
             return out.transpose(1, 2).squeeze(0)
 
         if seq_lens is not None:
@@ -351,7 +413,9 @@ class FusedTurboQuantImpl(_AttentionImplBase):
                 k_s = self._repeat_kv(k_s)
                 v_s = self._repeat_kv(v_s)
 
-                out_s = F.scaled_dot_product_attention(q_s, k_s, v_s, is_causal=True)
+                out_s = F.scaled_dot_product_attention(
+                    q_s, k_s, v_s, scale=self.scale, is_causal=True
+                )
                 outputs.append(out_s.transpose(1, 2).squeeze(0))
                 offset += slen
             return torch.cat(outputs, dim=0)
@@ -361,7 +425,7 @@ class FusedTurboQuantImpl(_AttentionImplBase):
         v = value.unsqueeze(0).transpose(1, 2)
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale, is_causal=True)
         return out.transpose(1, 2).squeeze(0)
 
     def _forward_decode(
@@ -380,7 +444,14 @@ class FusedTurboQuantImpl(_AttentionImplBase):
             5. Gather + decompress V
             6. attn_weights @ V
         """
-        from fused_turboquant.kernels.triton_attention import fused_qk_scores_rht
+        if self.kind == "rht":
+            from fused_turboquant.kernels.triton_attention import fused_qk_scores_rht
+            qk_kernel = fused_qk_scores_rht
+        else:
+            from fused_turboquant.kernels.triton_planar_attention import (
+                fused_qk_scores_planar,
+            )
+            qk_kernel = fused_qk_scores_planar
 
         batch_size = query.shape[0]  # decode: 1 token per sequence
         block_tables = attn_metadata.block_tables
@@ -402,10 +473,14 @@ class FusedTurboQuantImpl(_AttentionImplBase):
         )
 
         q_flat = query.float().reshape(-1, self.head_size)
-        q_rot = randomized_hadamard(q_flat, self.rht_signs)
+        if self.kind == "rht":
+            q_rot = randomized_hadamard(q_flat, self.rotation_state)
+        else:
+            from fused_turboquant.core.planar import planar_rotate
+            q_rot = planar_rotate(q_flat, self.rotation_state)
         q_rot = q_rot.view(batch_size, self.num_heads, 1, self.head_size)
 
-        attn_scores = fused_qk_scores_rht(
+        attn_scores = qk_kernel(
             q_rot,
             k_packed,
             k_norms,
