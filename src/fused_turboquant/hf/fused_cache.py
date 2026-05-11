@@ -145,17 +145,39 @@ class CompressedKVCache(DynamicCache):
     def __init__(self, quantizer: TurboQuantMSE, compress_v: bool = True):
         super().__init__()
         self.tq = quantizer
+        # Per-layer quantizer registries. K and V can use different
+        # quantizers (e.g. K at 4-bit, V at 3-bit). When only the K dict is
+        # populated, V falls back to the same quantizer as K — preserves the
+        # historical behavior where bits applied to both.
         self._layer_tq: dict[int, TurboQuantMSE] = {}
+        self._layer_tq_v: dict[int, TurboQuantMSE] = {}
         self.compress_v = compress_v
         self._compressed_keys: list[Optional[dict]] = []
         self._compressed_values: list[Optional[dict]] = []
 
     def set_layer_quantizer(self, layer_idx: int, tq: TurboQuantMSE) -> None:
-        """Register a per-layer quantizer for adaptive mixed-precision."""
+        """Register a per-layer quantizer for K (and V, unless V is set separately).
+
+        Calling only this method keeps the historical single-quantizer behavior;
+        the V cache reads back through the same quantizer.
+        """
         self._layer_tq[layer_idx] = tq
 
+    def set_layer_quantizer_v(self, layer_idx: int, tq: TurboQuantMSE) -> None:
+        """Register a per-layer V quantizer (overrides the K one for value paths)."""
+        self._layer_tq_v[layer_idx] = tq
+
     def get_layer_quantizer(self, layer_idx: int) -> TurboQuantMSE:
-        """Get the quantizer for a layer, falling back to the default."""
+        """K-side quantizer for a layer, falling back to the default."""
+        return self._layer_tq.get(layer_idx, self.tq)
+
+    def get_layer_quantizer_v(self, layer_idx: int) -> TurboQuantMSE:
+        """V-side quantizer for a layer.
+
+        Resolution order: per-layer V → per-layer K (shared) → default.
+        """
+        if layer_idx in self._layer_tq_v:
+            return self._layer_tq_v[layer_idx]
         return self._layer_tq.get(layer_idx, self.tq)
 
     # -- Key compression (packed uint8, unpacked inline by fused kernel) ------
@@ -202,7 +224,7 @@ class CompressedKVCache(DynamicCache):
         while len(self._compressed_values) <= layer_idx:
             self._compressed_values.append(None)
 
-        tq = self.get_layer_quantizer(layer_idx)
+        tq = self.get_layer_quantizer_v(layer_idx)
         compressed = tq.encode(value_states.float())
 
         packed_shape = list(value_states.shape[:-1]) + [compressed.indices.shape[-1]]
@@ -233,7 +255,7 @@ class CompressedKVCache(DynamicCache):
 
         Returns tensor of shape [batch, n_kv_heads, kv_len, head_dim] in float32.
         """
-        tq = self.get_layer_quantizer(layer_idx)
+        tq = self.get_layer_quantizer_v(layer_idx)
         entry = self._compressed_values[layer_idx]
         ct = CompressedTensor(
             indices=entry["packed_indices"],
@@ -884,6 +906,7 @@ def patch_model(
     tokenizer=None,
     calibration_text: str | None = None,
     quantizer_kind: str = "rht",
+    v_bits: int | None = None,
 ) -> CompressedKVCache:
     """Patch all full-attention layers in a model to use fused TurboQuant.
 
@@ -914,27 +937,39 @@ def patch_model(
               (O(d log d) butterfly). Requires power-of-2 head_dim.
             - "planar": PlanarQuantMSE — per-pair 2D Givens rotation
               (4 FMAs per pair, lighter rotation state). Requires even head_dim.
+        v_bits: Optional separate bit-width for the V cache. When None
+            (default), V uses the same bit-width as K (`bits`). Set this to
+            run mixed-precision K/V (e.g. `bits=4, v_bits=3` for 4-bit K +
+            3-bit V — typical when K is more sensitive to quantization than
+            V on the target model).
 
     Returns a CompressedKVCache to pass as past_key_values to model.generate().
     """
-    config = _resolve_config(model)
-
     if quantizer_kind not in ("rht", "planar"):
         raise ValueError(
             f"quantizer_kind must be 'rht' or 'planar', got {quantizer_kind!r}"
         )
-
-    if quantizer_kind == "rht":
-        QuantizerCls = TurboQuantMSE
-    else:
-        from fused_turboquant.core.planar import PlanarQuantMSE
-        QuantizerCls = PlanarQuantMSE
 
     if bits not in (2, 3, 4):
         raise ValueError(
             f"bits must be 2, 3, or 4, got {bits}. "
             f"Lloyd-Max codebooks are only precomputed for these bit-widths."
         )
+
+    if v_bits is None:
+        v_bits = bits
+    if v_bits not in (2, 3, 4):
+        raise ValueError(
+            f"v_bits must be 2, 3, or 4 (or None), got {v_bits}."
+        )
+
+    config = _resolve_config(model)
+
+    if quantizer_kind == "rht":
+        QuantizerCls = TurboQuantMSE
+    else:
+        from fused_turboquant.core.planar import PlanarQuantMSE
+        QuantizerCls = PlanarQuantMSE
 
     device = next(model.parameters()).device
 
@@ -1033,6 +1068,14 @@ def patch_model(
         layer_bits = bit_map[layer_idx] if bit_map else default_bits
         layer_tq = get_tq(layer_bits, layer_hd)
         cache.set_layer_quantizer(layer_idx, layer_tq)
+        # Per-layer V quantizer: reuse layer_tq when v_bits == K's bits to
+        # avoid building a duplicate codebook; otherwise build a (head_dim,
+        # v_bits) quantizer and register it separately.
+        if v_bits == layer_bits:
+            layer_tq_v = layer_tq
+        else:
+            layer_tq_v = get_tq(v_bits, layer_hd)
+            cache.set_layer_quantizer_v(layer_idx, layer_tq_v)
         layer_compress_v = _resolve_compress_v(compress_v, layer_idx, n_layers)
         if layer_compress_v:
             v_compressed_count += 1
@@ -1076,11 +1119,12 @@ def patch_model(
             if len(unique_head_dims) == 1
             else f"head_dims={unique_head_dims}"
         )
+        bits_summary = f"{bits}-bit" if v_bits == bits else f"K={bits}-bit V={v_bits}-bit"
         logger.info(
-            "Patched %d attention layers with fused TurboQuant (kind=%s, %d-bit, %s compression, %s)",
+            "Patched %d attention layers with fused TurboQuant (kind=%s, %s, %s compression, %s)",
             patched,
             quantizer_kind,
-            bits,
+            bits_summary,
             kv_mode,
             hd_summary,
         )
