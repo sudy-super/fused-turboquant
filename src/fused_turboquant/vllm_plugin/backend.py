@@ -36,6 +36,8 @@ from fused_turboquant.vllm_plugin.cache_ops import (
 logger = logging.getLogger(__name__)
 
 _TURBOQUANT_BITS = int(os.environ.get("TURBOQUANT_BITS", "4"))
+_TURBOQUANT_V_BITS_RAW = os.environ.get("TURBOQUANT_V_BITS")
+_TURBOQUANT_V_BITS = int(_TURBOQUANT_V_BITS_RAW) if _TURBOQUANT_V_BITS_RAW else _TURBOQUANT_BITS
 
 _AttentionBackendBase: Type = object
 try:
@@ -112,10 +114,13 @@ class FusedTurboQuantBackend(_AttentionBackendBase):
 
         Instead of [2, num_blocks, block_size, num_kv_heads, head_size] in fp16,
         we use [2, num_blocks, block_size, num_kv_heads, compressed_elem_size]
-        in uint8, where compressed_elem_size = packed_dim + 4 (fp32 norm bytes).
+        in uint8. With mixed K/V bit-widths the slot has to be wide enough for
+        whichever of K and V packs to more bytes, so we take the max of the
+        two compressed sizes.
         """
-        bits = _TURBOQUANT_BITS
-        compressed_size = compute_compressed_elem_size(head_size, bits)
+        k_size = compute_compressed_elem_size(head_size, _TURBOQUANT_BITS)
+        v_size = compute_compressed_elem_size(head_size, _TURBOQUANT_V_BITS)
+        compressed_size = max(k_size, v_size)
         return (2, num_blocks, block_size, num_kv_heads, compressed_size)
 
     @staticmethod
@@ -151,8 +156,14 @@ class FusedTurboQuantBackend(_AttentionBackendBase):
 
     @classmethod
     def get_supported_head_sizes(cls) -> List[int]:
-        """Power-of-2 head sizes required by RHT butterfly operations."""
-        return [64, 128, 256]
+        """Supported head sizes.
+
+        RHT (default) needs power-of-2 head_dim and we ship Triton kernels for
+        64/128/256/512 — the last one covers Gemma 4's full_attention layers
+        (global_head_dim=512). PlanarQuant only requires an even head_dim and
+        the same set is supported there.
+        """
+        return [64, 128, 256, 512]
 
     @staticmethod
     def validate_configuration(
@@ -160,7 +171,18 @@ class FusedTurboQuantBackend(_AttentionBackendBase):
         **kwargs: Any,
     ) -> None:
         """Raise if configuration is incompatible with this backend."""
-        if head_size > 0 and (head_size & (head_size - 1)) != 0:
-            raise ValueError(
-                f"FUSED_TURBOQUANT requires power-of-2 head_size for RHT, got {head_size}"
-            )
+        kind = os.environ.get("TURBOQUANT_KIND", "rht")
+        if head_size <= 0:
+            return
+        if kind == "rht":
+            if (head_size & (head_size - 1)) != 0:
+                raise ValueError(
+                    f"FUSED_TURBOQUANT (kind=rht) requires power-of-2 head_size for RHT, "
+                    f"got {head_size}. For non-power-of-2 even head_dims set "
+                    f"TURBOQUANT_KIND=planar."
+                )
+        else:
+            if head_size % 2 != 0:
+                raise ValueError(
+                    f"FUSED_TURBOQUANT (kind=planar) requires even head_size, got {head_size}"
+                )
