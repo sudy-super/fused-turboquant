@@ -57,16 +57,31 @@ def register_backend() -> None:
 
 
 def _patch_attention_get_kv_cache_spec() -> None:
-    """Force every attention layer to expose a TQFullAttentionSpec.
+    """Force every attention layer to expose a TQFullAttentionSpec whose
+    `tq_slot_size` matches what `FusedTurboQuantV1Backend.get_kv_cache_shape`
+    returns.
 
-    The default `Attention.get_kv_cache_spec` returns FullAttentionSpec for
-    `kv_cache_dtype="auto"` (e.g. the vision encoder of multimodal Gemma 4),
-    which has a leading-2 page layout and a different page size than
-    TurboQuant text-decoder layers. By making every attention layer carry a
-    TQFullAttentionSpec with `tq_slot_size = slot_size_for(head_size,
-    cache_dtype)`, the framework can compare scalar page sizes and the unify
-    shim can widen smaller layers via `page_size_padded`. Quantized layers
-    behave exactly as before.
+    vLLM's stock `Attention.get_kv_cache_spec` can emit three relevant
+    shapes for layers we'd like to back with TurboQuant kernels:
+
+    - `SlidingWindowSpec` (e.g. Gemma 4 sliding text decoder layers)
+    - `FullAttentionSpec` (e.g. raw fp16 / bf16 layers, or full text
+      layers on vLLM builds without TQFullAttentionSpec)
+    - `TQFullAttentionSpec` (full text layers with kv_cache_dtype set to a
+      built-in `turboquant_*` preset)
+
+    The third case is the subtle one: vLLM constructs the TQFullAttentionSpec
+    with its OWN `tq_slot_size` derived from the preset's `slot_size_aligned`,
+    which differs from the power-of-2 rounded value our backend uses in
+    `get_kv_cache_shape`. That mismatch was the source of the
+    `[120380, 16, 16, 1024]` vs half-size allocation bug — `spec.page_size_bytes`
+    came from vLLM's number, the raw tensor allocator used `spec.page_size_bytes`
+    too, and then our shape function returned a bigger numel that no longer fit.
+
+    Fix: rebuild EVERY `TQFullAttentionSpec` (along with the other two
+    cases) using our own `_slot_size_for(head_size, cache_dtype)`. Now
+    `spec.page_size_bytes` and `get_kv_cache_shape().numel()` are derived
+    from the same formula, so allocation always lines up.
     """
     try:
         from vllm.model_executor.layers.attention import attention as _attn_mod
@@ -88,6 +103,21 @@ def _patch_attention_get_kv_cache_spec() -> None:
     def patched(self, *args, **kwargs):  # type: ignore[no-redef]
         spec = original(self, *args, **kwargs)
         cache_dtype = getattr(self, "kv_cache_dtype", "auto") or "auto"
+        # CRITICAL: only rewrite for layers that will actually use the
+        # TurboQuant backend (kv_cache_dtype="turboquant_*"). Layers with
+        # kv_cache_dtype="auto" / "float16" / "bfloat16" are dispatched to
+        # FLASH_ATTN / TRITON_ATTN / etc., whose `get_kv_cache_shape`
+        # produces a 5-D `(2, num_blocks, block_size, num_kv_heads,
+        # head_size)` layout in bf16 — entirely incompatible with our
+        # 4-D uint8 byte slot. If we rewrote those specs to
+        # `TQFullAttentionSpec(dtype=uint8, ...)`, the allocator would
+        # carve a uint8 buffer that the non-TQ backend then tries to view
+        # as bf16-typed 5-D, and the .view() call fails with a size
+        # mismatch. Leave non-TQ layers' specs untouched.
+        if not (
+            isinstance(cache_dtype, str) and cache_dtype.startswith("turboquant_")
+        ):
+            return spec
         slot_size = FusedTurboQuantV1Backend._slot_size_for(self.head_size, cache_dtype)
         # All TurboQuant slots are byte arrays — vLLM views the raw allocation
         # as `spec.dtype` to compute element count, so we MUST advertise uint8
@@ -98,21 +128,20 @@ def _patch_attention_get_kv_cache_spec() -> None:
             block_size=spec.block_size,
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
-            head_size_v=spec.head_size_v,
+            head_size_v=getattr(spec, "head_size_v", spec.head_size),
             dtype=torch.uint8,
             tq_slot_size=slot_size,
         )
-        # SlidingWindowSpec on a TurboQuant layer: vLLM's stock code returns a
-        # SlidingWindowSpec that pretends head_size is the slot size and
-        # therefore ignores TurboQuant entirely. Re-emit it as a
-        # TQFullAttentionSpec; the sliding-window mask is applied at runtime
-        # by FusedTurboQuantV1Impl.forward().
-        if isinstance(spec, SlidingWindowSpec) and cache_dtype.startswith("turboquant_"):
+        # Order matters: check TQFullAttentionSpec BEFORE FullAttentionSpec
+        # because TQFullAttentionSpec is a subclass of FullAttentionSpec on
+        # some vLLM versions. We rebuild it unconditionally to install our
+        # own tq_slot_size (vLLM's internal default disagrees with our
+        # get_kv_cache_shape's power-of-2 rounded value).
+        if isinstance(spec, TQFullAttentionSpec):
             return TQFullAttentionSpec(**tq_kwargs)
-        # Plain `FullAttentionSpec` (auto / fp16 / bf16 layers like the
-        # vision encoder of Gemma 4): redirect to TQFullAttentionSpec so we
-        # use a uniform K+V slot layout that the unify shim can pad.
-        if type(spec) is FullAttentionSpec:
+        if isinstance(spec, SlidingWindowSpec):
+            return TQFullAttentionSpec(**tq_kwargs)
+        if isinstance(spec, FullAttentionSpec):
             return TQFullAttentionSpec(**tq_kwargs)
         return spec
 
@@ -120,27 +149,29 @@ def _patch_attention_get_kv_cache_spec() -> None:
     Attention.get_kv_cache_spec = patched
     logger.info(
         "fused-turboquant: patched Attention.get_kv_cache_spec to emit "
-        "TQFullAttentionSpec for raw fp16/bf16 layers (uniform 4-D slot layout)"
+        "TQFullAttentionSpec with our own tq_slot_size on every layer"
     )
 
 
 def _patch_unify_page_size() -> None:
     """Replace `unify_kv_cache_spec_page_size` with a version that widens
-    non-divisible specs via `page_size_padded` instead of erroring.
+    smaller specs by an integer ratio of block_size.
 
-    The original vLLM impl (vllm.v1.core.kv_cache_utils) only knows how to
-    inflate a layer's block_size by an integer ratio. For multimodal models
-    that mix a TurboQuant-slot text decoder and a raw-fp16 vision encoder,
-    those page sizes are typically not in an integer ratio (e.g. text
-    slot=262 B × 16 heads vs vision raw=72 × 2 B = 144 B × 16 heads), so the
-    upstream code raises NotImplementedError. AttentionSpec already supports
-    `page_size_padded` as an override knob; we just teach the unifier to use
-    it.
+    The stock vLLM implementation does exactly this when page sizes are in
+    an integer ratio, and raises NotImplementedError otherwise. Our
+    `_slot_size_for` rounds slot bytes up to a power of 2, so the cross-
+    layer page_size ratios in Gemma 4 (sliding head_dim=256 vs full
+    head_dim=512) are guaranteed to be a power-of-2 ratio. Therefore the
+    integer-ratio path is always sufficient.
+
+    Why patch at all if the stock impl can do this? Because some vLLM
+    builds emit `NotImplementedError` for any mismatch without trying the
+    ratio path. Stamping our own version makes the behavior deterministic
+    across vLLM versions.
     """
     try:
         from dataclasses import replace
         from vllm.v1.core import kv_cache_utils
-        from vllm.v1.kv_cache_interface import AttentionSpec
     except ImportError:
         return
 
@@ -155,84 +186,30 @@ def _patch_unify_page_size() -> None:
         max_page_size = max(page_sizes)
         new_kv_cache_spec = {}
         for layer_name, layer_spec in kv_cache_spec.items():
-            if layer_spec.page_size_bytes == max_page_size:
+            layer_page_size = layer_spec.page_size_bytes
+            if layer_page_size == max_page_size:
                 new_kv_cache_spec[layer_name] = layer_spec
                 continue
-            layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size == 0:
-                # Original strategy: bump block_size by the integer ratio.
-                ratio = max_page_size // layer_page_size
-                new_kv_cache_spec[layer_name] = replace(
-                    layer_spec, block_size=layer_spec.block_size * ratio
+            if max_page_size % layer_page_size != 0:
+                raise NotImplementedError(
+                    "fused-turboquant unify shim expected integer-ratio "
+                    f"page sizes (max={max_page_size}, layer "
+                    f"{layer_name}={layer_page_size}). Power-of-2 slot "
+                    "rounding in _slot_size_for should make this hold — "
+                    "if you hit this, slot_size for some layer is not a "
+                    "power of 2."
                 )
-            else:
-                # New: pad this layer's slot via page_size_padded so its
-                # page_size_bytes lines up with max_page_size. Only works on
-                # AttentionSpec subclasses (the only ones that expose the
-                # padding knob).
-                if not isinstance(layer_spec, AttentionSpec):
-                    raise NotImplementedError(
-                        "Non-AttentionSpec layer with non-divisible page size: "
-                        f"{type(layer_spec).__name__} {layer_name}"
-                    )
-                logger.info(
-                    "fused-turboquant: padding %s %s: real_page_size=%d → "
-                    "padded=%d",
-                    layer_name,
-                    type(layer_spec).__name__,
-                    layer_page_size,
-                    max_page_size,
-                )
-                new_kv_cache_spec[layer_name] = replace(
-                    layer_spec, page_size_padded=max_page_size
-                )
-        # Stamp the unified per-(block_size, num_kv_heads, head_size, dtype)
-        # slot bytes into the backend so its get_kv_cache_shape can return a
-        # tensor with the same numel as the padded page_size_bytes.
-        #
-        # IMPORTANT: this must run on every layer in the spec map, INCLUDING
-        # the layer whose original page_size_bytes already equals
-        # max_page_size — we still need to advertise its slot through the
-        # override map so get_kv_cache_shape returns the same numel that vLLM
-        # will allocate. (raw_tensor.size() is num_blocks * page_size_bytes
-        # for the WHOLE spec map, so even the "winning" layer must match the
-        # padded page_size.)
-        try:
-            from fused_turboquant.vllm_plugin.v1_backend import (
-                FusedTurboQuantV1Backend,
+            ratio = max_page_size // layer_page_size
+            new_kv_cache_spec[layer_name] = replace(
+                layer_spec, block_size=layer_spec.block_size * ratio
             )
-        except ImportError:
-            return new_kv_cache_spec
-        from vllm.v1.kv_cache_interface import (
-            FullAttentionSpec,
-            TQFullAttentionSpec,
-        )
-        max_page_size_resolved = max_page_size
-        for layer_name, spec in new_kv_cache_spec.items():
-            if not isinstance(spec, (FullAttentionSpec, TQFullAttentionSpec)):
-                continue
-            # The final page size every layer needs to expose is the unified
-            # max_page_size (after padding). Compute the per-token-per-head
-            # slot from that and the (block_size, num_kv_heads) of THIS layer.
-            slot = max_page_size_resolved // (spec.block_size * spec.num_kv_heads)
-            for dt in (
-                "auto",
-                "float16",
-                "bfloat16",
-                "turboquant_4bit_nc",
-                "turboquant_3bit_nc",
-                "turboquant_k3v4_nc",
-                "turboquant_k8v4",
-            ):
-                key = (spec.block_size, spec.num_kv_heads, spec.head_size, dt)
-                FusedTurboQuantV1Backend._slot_size_overrides[key] = slot
         return new_kv_cache_spec
 
     patched._ft_patched = True  # type: ignore[attr-defined]
     kv_cache_utils.unify_kv_cache_spec_page_size = patched
     logger.info(
-        "fused-turboquant: patched unify_kv_cache_spec_page_size to support "
-        "non-divisible mixed page sizes via page_size_padded"
+        "fused-turboquant: patched unify_kv_cache_spec_page_size to widen "
+        "smaller layers by integer block_size ratio (power-of-2 only)"
     )
 
 
