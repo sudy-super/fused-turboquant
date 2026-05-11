@@ -121,9 +121,15 @@ class FusedTurboQuantV1Backend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
 
     supported_dtypes: ClassVar[list] = [torch.float16, torch.bfloat16]
-    # We accept the same preset names as the built-in TurboQuant backend
-    # so the same vLLM-side spec / config wiring lights up.
+    # We accept the TurboQuant presets (text decoder layers) PLUS the standard
+    # `auto` / fp16 / bf16 dtypes that vision-encoder layers ask for in
+    # multimodal models like Gemma 4. Non-quantized layers fall through to a
+    # plain SDPA path so the whole multimodal model can run on this single
+    # backend.
     supported_kv_cache_dtypes: ClassVar[list] = [
+        "auto",
+        "float16",
+        "bfloat16",
         "turboquant_k8v4",
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
@@ -144,9 +150,10 @@ class FusedTurboQuantV1Backend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        # vLLM's built-in TurboQuant metadata builder produces exactly the
-        # fields we consume in forward (split_decodes_and_prefills, etc.),
-        # so we reuse it instead of re-implementing.
+        # vLLM's built-in TurboQuant metadata builder produces the same fields
+        # vLLM's built-in TritonAttentionMetadataBuilder does (query_start_loc /
+        # seq_lens / block_table / slot_mapping). We reuse it for both the
+        # TurboQuant and raw fp16 forwards.
         from vllm.v1.attention.backends.turboquant_attn import (
             TurboQuantMetadataBuilder,
         )
@@ -161,18 +168,28 @@ class FusedTurboQuantV1Backend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "turboquant_4bit_nc",
     ) -> tuple:
-        from vllm.model_executor.layers.quantization.turboquant.config import (
-            TurboQuantConfig,
-        )
+        """Per-layer cache shape.
 
-        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
-        return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
+        For TurboQuant presets we use vLLM's combined K+V slot layout (no
+        leading 2 dim) so the framework's TQFullAttentionSpec memory accounting
+        lines up. For `auto` / `float16` / `bfloat16` layers (e.g. vision
+        encoder) we fall back to the canonical (num_blocks, 2, block_size,
+        num_kv_heads, head_size) layout that every other backend produces.
+        """
+        if cache_dtype_str is not None and cache_dtype_str.startswith("turboquant_"):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
+            tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
+            return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype) -> bool:
         if kv_cache_dtype is None:
-            return False
-        return kv_cache_dtype.startswith("turboquant_")
+            return True
+        return kv_cache_dtype in cls.supported_kv_cache_dtypes
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
@@ -188,7 +205,14 @@ class FusedTurboQuantV1Backend(AttentionBackend):
 
     @classmethod
     def supports_attn_type(cls, attn_type) -> bool:
-        return attn_type == AttentionType.DECODER
+        # Decoder (autoregressive) for text layers, encoder / encoder-only for
+        # the vision tower's bidirectional attention. The encoder paths are
+        # only exercised by the fp16 fallback.
+        return attn_type in (
+            AttentionType.DECODER,
+            AttentionType.ENCODER,
+            AttentionType.ENCODER_ONLY,
+        )
 
     @classmethod
     def supports_compute_capability(cls, capability) -> bool:
@@ -241,22 +265,9 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             raise NotImplementedError(
                 "FusedTurboQuantV1Impl does not support ALiBi attention"
             )
-        if attn_type is not None and attn_type != AttentionType.DECODER:
-            raise NotImplementedError(
-                f"FusedTurboQuantV1Impl only supports decoder attention, got {attn_type}"
-            )
         if kv_sharing_target_layer_name is not None:
             raise NotImplementedError(
                 "FusedTurboQuantV1Impl does not yet support KV sharing"
-            )
-        if not (
-            isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_")
-        ):
-            raise ValueError(
-                f"FusedTurboQuantV1Impl requires kv_cache_dtype to be a turboquant_* "
-                f"preset (got {kv_cache_dtype!r}). "
-                f"Pick one of: turboquant_4bit_nc, turboquant_3bit_nc, "
-                f"turboquant_k3v4_nc, turboquant_k8v4."
             )
 
         self.num_heads = num_heads
@@ -267,6 +278,37 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self.sliding_window = sliding_window
         self.kv_cache_dtype = kv_cache_dtype
         self.logits_soft_cap = logits_soft_cap
+        self.attn_type = attn_type or AttentionType.DECODER
+
+        # Branch between the quantized TurboQuant path and the raw fp16 SDPA
+        # fallback. The fallback is needed so that multimodal models like
+        # Gemma 4 can run end-to-end on this single backend: text-decoder
+        # layers stay quantized, vision-encoder layers (kv_cache_dtype="auto")
+        # fall through to plain SDPA over the canonical (num_blocks, 2, ...)
+        # cache layout.
+        self._is_raw = not (
+            isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_")
+        )
+        if self._is_raw:
+            logger.info(
+                "FusedTurboQuantV1Impl init: raw mode (kv_cache_dtype=%s) — "
+                "no quantization, plain SDPA. head_size=%d num_heads=%d "
+                "num_kv_heads=%d attn_type=%s sliding_window=%s",
+                kv_cache_dtype,
+                head_size,
+                num_heads,
+                num_kv_heads,
+                self.attn_type,
+                sliding_window,
+            )
+            return
+
+        if self.attn_type != AttentionType.DECODER:
+            raise NotImplementedError(
+                f"FusedTurboQuantV1Impl quantized path only supports decoder "
+                f"attention, got {self.attn_type}. Use kv_cache_dtype='auto' "
+                f"on this layer to fall through to the fp16 SDPA path."
+            )
 
         # Resolve preset → bit-widths via vLLM's TurboQuantConfig.
         from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -487,16 +529,41 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Called by vLLM before forward to store new K/V into the cache.
-
-        key / value: [N, num_kv_heads, head_size] (or [N, num_kv_heads*head_size])
-        """
+        """Called by vLLM before forward to store new K/V into the cache."""
         N = slot_mapping.shape[0]
         if N <= 0:
             return
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            # Encoder attention has no persistent KV cache.
+            return
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
-        self._store_kv(k, v, kv_cache, slot_mapping)
+        if self._is_raw:
+            self._store_raw_kv(k, v, kv_cache, slot_mapping)
+        else:
+            self._store_kv(k, v, kv_cache, slot_mapping)
+
+    def _store_raw_kv(
+        self,
+        key: torch.Tensor,  # [n_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write raw fp16/bf16 K and V into the canonical paged layout."""
+        n_tokens = key.shape[0]
+        if n_tokens == 0:
+            return
+        block_size = kv_cache.shape[2]
+        cache_dtype = kv_cache.dtype
+        slot_cpu = slot_mapping.tolist()
+        for i, slot in enumerate(slot_cpu):
+            if slot < 0:
+                continue
+            block_idx = slot // block_size
+            offset = slot % block_size
+            kv_cache[block_idx, 0, offset] = key[i].to(cache_dtype)
+            kv_cache[block_idx, 1, offset] = value[i].to(cache_dtype)
 
     def forward(
         self,
@@ -549,7 +616,11 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             k_i = key[q_s:q_e].view(q_len, self.num_kv_heads, self.head_size)
             v_i = value[q_s:q_e].view(q_len, self.num_kv_heads, self.head_size)
 
-            if q_len > 1:
+            if self._is_raw:
+                attn_out[q_s:q_e] = self._forward_raw_seq(
+                    q_i, k_i, v_i, kv_cache, block_table[i], seq_len, context_len
+                )
+            elif q_len > 1:
                 if context_len > 0:
                     raise NotImplementedError(
                         "FusedTurboQuantV1Impl: chunked prefill (context_len>0 with "
@@ -567,6 +638,109 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         else:
             output[:N] = attn_out.reshape(N, -1).to(output.dtype)
         return output
+
+    # ------------------------------------------------------------------
+    # raw fp16/bf16 SDPA fallback
+    # ------------------------------------------------------------------
+
+    def _forward_raw_seq(
+        self,
+        query: torch.Tensor,  # [q_len, num_heads, head_size]
+        key: torch.Tensor,  # [q_len, num_kv_heads, head_size] (new tokens this step)
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
+        block_table_row: torch.Tensor,
+        seq_len: int,
+        context_len: int,
+    ) -> torch.Tensor:
+        """Plain SDPA on raw fp16/bf16 K/V for one sequence.
+
+        Handles three sub-cases:
+          - encoder / encoder-only: bidirectional attention on this step's
+            K/V alone (no cache, no past context).
+          - decoder, query_len > 1, no context: causal attention on new K/V.
+          - decoder, query_len == 1: gather full cached K/V then attend.
+        Chunked prefill (decoder, query_len > 1 with context_len > 0) raises
+        NotImplementedError — same restriction as the TQ path.
+        """
+        q_len = query.shape[0]
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return self._sdpa_local(query, key, value, is_causal=False)
+
+        if q_len > 1 and context_len == 0:
+            return self._sdpa_local(query, key, value, is_causal=True)
+        if q_len > 1 and context_len > 0:
+            raise NotImplementedError(
+                "FusedTurboQuantV1Impl raw fp16 fallback: chunked prefill is "
+                "not supported. Disable chunked prefill."
+            )
+
+        # query_len == 1 (decoder decode step). Gather the full cached K/V
+        # for this sequence and attend.
+        cached_k, cached_v = self._gather_raw_kv(kv_cache, block_table_row, seq_len)
+        return self._sdpa_with_cached(query, cached_k, cached_v, seq_len)
+
+    def _sdpa_local(
+        self,
+        q: torch.Tensor,  # [q_len, num_heads, head_size]
+        k: torch.Tensor,  # [q_len, num_kv_heads, head_size]
+        v: torch.Tensor,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """SDPA on the new K/V only (no cache). Returns [q_len, num_heads, head_size]."""
+        qt = q.unsqueeze(0).transpose(1, 2)  # [1, h, s, d]
+        kt = k.unsqueeze(0).transpose(1, 2)
+        vt = v.unsqueeze(0).transpose(1, 2)
+        kt = self._repeat_kv(kt)
+        vt = self._repeat_kv(vt)
+        out = F.scaled_dot_product_attention(
+            qt, kt, vt, scale=self.scale, is_causal=is_causal
+        )
+        return out.squeeze(0).transpose(0, 1).contiguous()
+
+    def _gather_raw_kv(
+        self,
+        kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
+        block_table_row: torch.Tensor,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Collect the full cached K and V for one sequence.
+
+        Returns:
+            K, V each shaped [1, num_kv_heads, seq_len, head_size]
+        """
+        block_size = kv_cache.shape[2]
+        n_blocks = (seq_len + block_size - 1) // block_size
+
+        k_parts, v_parts = [], []
+        for b in range(n_blocks):
+            block_idx = int(block_table_row[b].item())
+            tokens_here = min(block_size, seq_len - b * block_size)
+            k_parts.append(kv_cache[block_idx, 0, :tokens_here])
+            v_parts.append(kv_cache[block_idx, 1, :tokens_here])
+        k = torch.cat(k_parts, dim=0)  # [seq_len, num_kv_heads, head_size]
+        v = torch.cat(v_parts, dim=0)
+        k = k.transpose(0, 1).unsqueeze(0).contiguous()
+        v = v.transpose(0, 1).unsqueeze(0).contiguous()
+        return k, v
+
+    def _sdpa_with_cached(
+        self,
+        q: torch.Tensor,  # [1, num_heads, head_size]
+        k: torch.Tensor,  # [1, num_kv_heads, seq_len, head_size]
+        v: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Decode-step SDPA over the full cached K/V."""
+        qt = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, 1, head_size]
+        kt = self._repeat_kv(k)
+        vt = self._repeat_kv(v)
+        # We are at the most recent position; a causal mask of width 1 is a
+        # no-op, but SDPA expects either a mask or is_causal=False here.
+        out = F.scaled_dot_product_attention(
+            qt, kt, vt, scale=self.scale, is_causal=False
+        )
+        return out.squeeze(0).squeeze(1)  # [num_heads, head_size]
 
     def _prefill_one(
         self,
