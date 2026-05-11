@@ -28,7 +28,7 @@ from .base import (
 from .matrix import MatrixRotationStrategy
 
 # Import side-effect registers the built-in strategies.
-from . import hadamard, planar  # noqa: F401
+from . import hadamard, planar, rotor  # noqa: F401
 
 __all__ = [
     "RotationStrategy",
