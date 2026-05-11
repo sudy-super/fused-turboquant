@@ -39,6 +39,7 @@ KNOWN_COMPATIBLE = {
     "Qwen2_5ForCausalLM",
     "Qwen3ForCausalLM",
     "GemmaForCausalLM",
+    "Gemma4ForCausalLM",
     "InternLMForCausalLM",
     "InternLM2ForCausalLM",
     "YiForCausalLM",
@@ -50,6 +51,7 @@ KNOWN_COMPATIBLE = {
     # Multimodal (text decoder patched, vision encoder skipped)
     "Qwen2VLForConditionalGeneration",
     "InternVLForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
 }
 
 
@@ -75,6 +77,30 @@ def _find_output_proj(module) -> str | None:
     return None
 
 
+def _module_k_eq_v(module) -> bool:
+    """Detect attention modules where V projection is fused with K (Gemma 4 style).
+
+    Gemma 4 full-attention layers set `attention_k_eq_v=true` and omit v_proj
+    entirely. value_states are then taken from the k_proj output (with a separate
+    v_norm). We treat such modules as having "separate Q/K/V" for patching
+    purposes because k_proj's output supplies V at the storage level.
+    """
+    has_q = hasattr(module, "q_proj") and getattr(module, "q_proj") is not None
+    has_k = hasattr(module, "k_proj") and getattr(module, "k_proj") is not None
+    v_attr = getattr(module, "v_proj", "missing")
+    v_is_none = v_attr is None
+    if not (has_q and has_k and v_is_none):
+        return False
+    return bool(getattr(module, "use_alternative_attention", False)) or bool(
+        getattr(getattr(module, "config", None), "attention_k_eq_v", False)
+    )
+
+
+def _module_is_kv_shared(module) -> bool:
+    """Detect Gemma 4 KV-shared layers (no k_proj/v_proj; reuse another layer's KV)."""
+    return bool(getattr(module, "is_kv_shared_layer", False))
+
+
 def _probe_attention_module(module, config) -> dict:
     """Inspect an attention module for features that affect patching.
 
@@ -82,8 +108,12 @@ def _probe_attention_module(module, config) -> dict:
     make_fused_attention_forward() can reject unsupported configurations
     loudly rather than producing silent garbage.
     """
+    has_q = hasattr(module, "q_proj") and getattr(module, "q_proj") is not None
+    has_k = hasattr(module, "k_proj") and getattr(module, "k_proj") is not None
+    has_v = hasattr(module, "v_proj") and getattr(module, "v_proj") is not None
+    k_eq_v = _module_k_eq_v(module)
     return {
-        "has_separate_qkv": all(hasattr(module, p) for p in ("q_proj", "k_proj", "v_proj")),
+        "has_separate_qkv": has_q and has_k and (has_v or k_eq_v),
         "has_fused_qkv": hasattr(module, "qkv_proj") or hasattr(module, "c_attn"),
         "output_proj": _find_output_proj(module),
         "is_cross_attention": getattr(module, "is_cross_attention", False),
@@ -93,6 +123,8 @@ def _probe_attention_module(module, config) -> dict:
         "has_qk_norm": hasattr(module, "q_norm") or hasattr(module, "k_norm"),
         "attn_logit_softcapping": getattr(module, "attn_logit_softcapping", None),
         "rope_expected": _config_uses_rope(config),
+        "k_eq_v": k_eq_v,
+        "is_kv_shared": _module_is_kv_shared(module),
     }
 
 
@@ -264,13 +296,25 @@ def make_fused_attention_forward(
     QKV, sliding window, QK norm, logit softcapping, cross-attention) so that
     users get a clear error instead of silent garbage output.
     """
+    k_eq_v = False
+    is_kv_shared = False
     if config is not None:
         probe = _probe_attention_module(attn_module, config)
+        k_eq_v = probe["k_eq_v"]
+        is_kv_shared = probe["is_kv_shared"]
 
         if probe["is_cross_attention"]:
             raise ValueError(
                 f"Layer {layer_idx}: cross-attention layers cannot be patched. "
                 f"fused-turboquant only supports decoder self-attention."
+            )
+
+        if is_kv_shared:
+            raise ValueError(
+                f"Layer {layer_idx}: KV-shared layer (is_kv_shared_layer=True) is "
+                f"not yet supported. fused-turboquant cannot patch layers that reuse "
+                f"another layer's KV cache. Gemma 4 models with num_kv_shared_layers=0 "
+                f"are fine; set verify=False if you only want to patch eligible layers."
             )
 
         if probe["has_fused_qkv"] and not probe["has_separate_qkv"]:
@@ -311,7 +355,14 @@ def make_fused_attention_forward(
     centroids = quantizer.quantizer.levels
     head_dim = quantizer.head_dim
     bits = quantizer.bits
-    scale = 1.0 / math.sqrt(head_dim)
+
+    # Gemma 4 sets module.scaling=1.0 (Q/K are already RMS-normalized so the
+    # 1/sqrt(d) factor is absorbed into the norms). Use it when present.
+    module_scaling = getattr(attn_module, "scaling", None)
+    if module_scaling is not None:
+        scale = float(module_scaling)
+    else:
+        scale = 1.0 / math.sqrt(head_dim)
 
     n_heads = getattr(attn_module, "num_heads", None)
     if n_heads is None:
@@ -328,6 +379,7 @@ def make_fused_attention_forward(
 
     q_norm = getattr(attn_module, "q_norm", None)
     k_norm = getattr(attn_module, "k_norm", None)
+    v_norm = getattr(attn_module, "v_norm", None)
 
     def fused_forward(
         hidden_states: torch.Tensor,
@@ -340,17 +392,27 @@ def make_fused_attention_forward(
         bsz, q_len, _ = hidden_states.size()
 
         query_states = attn_module.q_proj(hidden_states)
-        key_states = attn_module.k_proj(hidden_states)
-        value_states = attn_module.v_proj(hidden_states)
+        key_proj_out = attn_module.k_proj(hidden_states)
+        # Gemma 4 full-attention layers (attention_k_eq_v=true) have no v_proj
+        # and reuse the k_proj output for V (with a different norm). Treat the
+        # missing v_proj here so V can still be stored in the compressed cache.
+        if k_eq_v or getattr(attn_module, "v_proj", None) is None:
+            value_proj_out = key_proj_out
+        else:
+            value_proj_out = attn_module.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, n_heads, head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+        key_states = key_proj_out.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+        value_states = value_proj_out.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
 
         if q_norm is not None:
             query_states = q_norm(query_states)
         if k_norm is not None:
             key_states = k_norm(key_states)
+        # v_norm (Gemma 4) is applied *before* the K-cache RoPE branch above
+        # diverges, but value_states bypass RoPE entirely so we just normalize.
+        if v_norm is not None:
+            value_states = v_norm(value_states)
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
@@ -467,24 +529,36 @@ _SKIP_NAME_KEYWORDS = (
 def _is_full_attention_layer(module, name: str = "") -> bool:
     """Detect if a module is a patchable self-attention layer.
 
-    Rejects cross-attention modules, vision encoder layers, and modules
-    that lack separate Q/K/V projections.
+    Rejects cross-attention modules, vision encoder layers, KV-shared layers
+    (Gemma 4) that don't own their own K/V weights, and modules that lack
+    separate Q/K/V projections. Modules where v_proj is None but k_eq_v=True
+    (Gemma 4 full-attention) are accepted: V is taken from k_proj's output.
     """
     if getattr(module, "is_cross_attention", False):
+        return False
+    if _module_is_kv_shared(module):
         return False
     name_lower = name.lower()
     if any(kw in name_lower for kw in _SKIP_NAME_KEYWORDS):
         return False
 
-    required = ["q_proj", "k_proj", "v_proj"]
+    has_q = hasattr(module, "q_proj") and getattr(module, "q_proj") is not None
+    has_k = hasattr(module, "k_proj") and getattr(module, "k_proj") is not None
+    has_v = hasattr(module, "v_proj") and getattr(module, "v_proj") is not None
+    has_qkv = has_q and has_k and (has_v or _module_k_eq_v(module))
     output = ["o_proj", "out_proj"]
-    has_qkv = all(hasattr(module, attr) for attr in required)
     has_output = any(hasattr(module, attr) for attr in output)
     return has_qkv and has_output
 
 
 def _resolve_head_dim(config) -> int:
-    """Extract head_dim from a HuggingFace model config."""
+    """Extract head_dim from a HuggingFace model config.
+
+    For multi-head_dim configs (e.g. Gemma 4 with global_head_dim != head_dim),
+    this returns the smaller of the two: it's only used for compatibility-check
+    fallbacks. The authoritative per-layer head_dim is read from each attention
+    module via _resolve_layer_head_dim().
+    """
     head_dim = getattr(config, "head_dim", None)
     if head_dim is not None:
         return head_dim
@@ -493,6 +567,20 @@ def _resolve_head_dim(config) -> int:
     if hidden_size is not None and num_heads is not None and num_heads > 0:
         return hidden_size // num_heads
     return 0
+
+
+def _resolve_layer_head_dim(module, config) -> int:
+    """Resolve the per-layer head_dim, honoring multi-head_dim configs.
+
+    Gemma 4 stores the effective head_dim on the attention module itself:
+    `head_dim` for sliding_attention layers, `global_head_dim` for full_attention
+    layers. We prefer that value when present, falling back to config-level
+    head_dim for models with a uniform head dimension.
+    """
+    layer_hd = getattr(module, "head_dim", None)
+    if isinstance(layer_hd, int) and layer_hd > 0:
+        return layer_hd
+    return _resolve_head_dim(config)
 
 
 def _resolve_config(model):
@@ -540,6 +628,7 @@ def check_model_compatibility(model) -> dict:
     fused_qkv_layers = 0
     cross_attention_layers = 0
     vision_layers_skipped = 0
+    layer_head_dims: list[int] = []
 
     for _name, module in model.named_modules():
         total += 1
@@ -564,14 +653,22 @@ def check_model_compatibility(model) -> dict:
             has_softcap = probe["attn_logit_softcapping"] is not None
             if has_softcap and "logit_softcapping" not in unsupported:
                 unsupported.append("logit_softcapping")
+            layer_head_dims.append(_resolve_layer_head_dim(module, config))
             eligible += 1
 
-    is_power_of_2 = head_dim >= 1 and (head_dim & (head_dim - 1)) == 0
+    unique_layer_head_dims = sorted(set(layer_head_dims))
+    # Use per-layer head_dim for the primary report when available (e.g. Gemma 4
+    # with global_head_dim != head_dim).
+    reported_head_dim = unique_layer_head_dims[0] if unique_layer_head_dims else head_dim
+    is_power_of_2 = all(
+        hd >= 1 and (hd & (hd - 1)) == 0 for hd in (unique_layer_head_dims or [head_dim])
+    )
 
-    if head_dim == 0:
+    if not unique_layer_head_dims and head_dim == 0:
         issues.append("Could not detect head_dim from model config")
     elif not is_power_of_2:
-        issues.append(f"head_dim={head_dim} is not a power of 2 — RHT requires 64, 128, 256, etc.")
+        bad = [hd for hd in (unique_layer_head_dims or [head_dim]) if hd < 1 or (hd & (hd - 1)) != 0]
+        issues.append(f"head_dim(s) {bad} not a power of 2 — RHT requires 64, 128, 256, 512, etc.")
 
     if n_kv_heads > 0 and n_q_heads % n_kv_heads != 0:
         issues.append(
@@ -609,7 +706,8 @@ def check_model_compatibility(model) -> dict:
     return {
         "compatible": compatible,
         "head_dim_valid": is_power_of_2,
-        "head_dim": head_dim,
+        "head_dim": reported_head_dim,
+        "head_dims": unique_layer_head_dims or ([head_dim] if head_dim else []),
         "n_q_heads": n_q_heads,
         "n_kv_heads": n_kv_heads,
         "eligible_layers": eligible,
@@ -631,7 +729,7 @@ def _smoke_test(
     cache: CompressedKVCache,
     originals: dict[str, object],
     config,
-    head_dim: int,
+    head_dims: int | list[int],
 ) -> None:
     """Run a single-token forward pass and verify fused output is reasonable.
 
@@ -768,49 +866,58 @@ def patch_model(
     """
     config = _resolve_config(model)
 
-    if head_dim is None:
-        head_dim = _resolve_head_dim(config)
-        if head_dim == 0:
-            raise ValueError(
-                "Could not detect head_dim from model config. "
-                "Pass head_dim explicitly: patch_model(model, bits=4, head_dim=128)"
-            )
-
-    if head_dim < 1 or (head_dim & (head_dim - 1)) != 0:
-        raise ValueError(
-            f"head_dim={head_dim} is not a power of 2. "
-            f"TurboQuant requires power-of-2 head dimensions (64, 128, 256, ...) "
-            f"because the Randomized Hadamard Transform uses butterfly operations. "
-            f"This model is not compatible with patch_model(). "
-            f"Use check_model_compatibility(model) for details."
-        )
-
     if bits not in (2, 3, 4):
         raise ValueError(
             f"bits must be 2, 3, or 4, got {bits}. "
             f"Lloyd-Max codebooks are only precomputed for these bit-widths."
         )
 
-    n_q_heads = getattr(config, "num_attention_heads", 0)
-    n_kv_heads = getattr(config, "num_key_value_heads", n_q_heads)
-    if n_kv_heads > 0 and n_q_heads % n_kv_heads != 0:
-        raise ValueError(
-            f"n_q_heads ({n_q_heads}) is not divisible by n_kv_heads ({n_kv_heads}). "
-            f"GQA grouping requires integer divisibility."
-        )
-
     device = next(model.parameters()).device
 
-    eligible_names = [
-        name for name, module in model.named_modules() if _is_full_attention_layer(module, name)
-    ]
-    n_layers = len(eligible_names)
+    eligible_modules: list[tuple[str, object, int]] = []
+    for name, module in model.named_modules():
+        if _is_full_attention_layer(module, name):
+            layer_hd = head_dim if head_dim is not None else _resolve_layer_head_dim(module, config)
+            if layer_hd < 1 or (layer_hd & (layer_hd - 1)) != 0:
+                raise ValueError(
+                    f"Layer {name}: head_dim={layer_hd} is not a power of 2. "
+                    f"TurboQuant requires power-of-2 head dimensions (64, 128, 256, 512, ...) "
+                    f"because the Randomized Hadamard Transform uses butterfly operations. "
+                    f"Use check_model_compatibility(model) for details."
+                )
+            eligible_modules.append((name, module, layer_hd))
+
+    if not eligible_modules and head_dim is None:
+        cfg_hd = _resolve_head_dim(config)
+        if cfg_hd == 0:
+            raise ValueError(
+                "Could not detect head_dim from model config and found no eligible "
+                "attention layers. Pass head_dim explicitly: patch_model(model, bits=4, head_dim=128)"
+            )
+
+    n_layers = len(eligible_modules)
+    unique_head_dims = sorted({hd for _, _, hd in eligible_modules})
+
+    # Per-config GQA validation only fires if the config exposes a single global
+    # n_kv_heads. Gemma 4 has two (num_key_value_heads, num_global_key_value_heads);
+    # both are validated implicitly via per-layer head/kv-head detection.
+    n_q_heads = getattr(config, "num_attention_heads", 0)
+    n_kv_heads_global = getattr(config, "num_key_value_heads", n_q_heads)
+    if (
+        n_kv_heads_global > 0
+        and n_q_heads % n_kv_heads_global != 0
+        and not hasattr(config, "num_global_key_value_heads")
+    ):
+        raise ValueError(
+            f"n_q_heads ({n_q_heads}) is not divisible by n_kv_heads ({n_kv_heads_global}). "
+            f"GQA grouping requires integer divisibility."
+        )
 
     bit_map: dict[int, int] | None = None
     if strategy == "adaptive":
         from fused_turboquant.core.adaptive import calibrate_layer_bits
 
-        cal_kwargs: dict = {"head_dim": head_dim}
+        cal_kwargs: dict = {"head_dim": unique_head_dims[0] if unique_head_dims else _resolve_head_dim(config)}
         if tokenizer is not None:
             cal_kwargs["tokenizer"] = tokenizer
         if calibration_text is not None:
@@ -822,46 +929,50 @@ def patch_model(
         bit_map = calibrate_layer_bits(model, **cal_kwargs)
 
     default_bits = bits
-    tq_cache: dict[int, TurboQuantMSE] = {}
+    tq_cache: dict[tuple[int, int], TurboQuantMSE] = {}
 
-    def get_tq(b: int) -> TurboQuantMSE:
-        if b not in tq_cache:
-            tq_cache[b] = TurboQuantMSE(
-                head_dim=head_dim,
+    def get_tq(b: int, hd: int) -> TurboQuantMSE:
+        key = (hd, b)
+        if key not in tq_cache:
+            tq_cache[key] = TurboQuantMSE(
+                head_dim=hd,
                 bits=b,
                 device=str(device),
                 max_iterations=max_iterations,
                 num_grid_points=num_grid_points,
             )
-        return tq_cache[b]
+        return tq_cache[key]
 
-    primary_tq = get_tq(default_bits)
+    # The cache's "primary" quantizer is just a fallback used by
+    # get_layer_quantizer() when a layer_idx hasn't been registered. Every
+    # patched layer registers its own per-(head_dim, bits) quantizer below,
+    # so the primary is effectively only consulted on misses.
+    primary_hd = unique_head_dims[0] if unique_head_dims else _resolve_head_dim(config)
+    primary_tq = get_tq(default_bits, primary_hd)
     any_v = not isinstance(compress_v, bool) or compress_v
     cache = CompressedKVCache(primary_tq, compress_v=any_v)
 
     patched = 0
-    layer_idx = 0
     originals = {}
     v_compressed_count = 0
 
-    for name, module in model.named_modules():
-        if _is_full_attention_layer(module, name):
-            layer_bits = bit_map[layer_idx] if bit_map else default_bits
-            layer_tq = get_tq(layer_bits)
-            layer_compress_v = _resolve_compress_v(compress_v, layer_idx, n_layers)
-            if layer_compress_v:
-                v_compressed_count += 1
-            originals[name] = module.forward
-            module.forward = make_fused_attention_forward(
-                module,
-                cache,
-                layer_tq,
-                layer_idx,
-                config=config,
-                compress_v=layer_compress_v,
-            )
-            patched += 1
-            layer_idx += 1
+    for layer_idx, (name, module, layer_hd) in enumerate(eligible_modules):
+        layer_bits = bit_map[layer_idx] if bit_map else default_bits
+        layer_tq = get_tq(layer_bits, layer_hd)
+        cache.set_layer_quantizer(layer_idx, layer_tq)
+        layer_compress_v = _resolve_compress_v(compress_v, layer_idx, n_layers)
+        if layer_compress_v:
+            v_compressed_count += 1
+        originals[name] = module.forward
+        module.forward = make_fused_attention_forward(
+            module,
+            cache,
+            layer_tq,
+            layer_idx,
+            config=config,
+            compress_v=layer_compress_v,
+        )
+        patched += 1
 
     model._fused_tq_originals = originals
 
@@ -886,15 +997,21 @@ def patch_model(
             kv_mode = "K-only"
         else:
             kv_mode = f"K+V({v_compressed_count}/{patched} layers)"
+        hd_summary = (
+            f"head_dim={unique_head_dims[0]}"
+            if len(unique_head_dims) == 1
+            else f"head_dims={unique_head_dims}"
+        )
         logger.info(
-            "Patched %d attention layers with fused TurboQuant (%d-bit, %s compression)",
+            "Patched %d attention layers with fused TurboQuant (%d-bit, %s compression, %s)",
             patched,
             bits,
             kv_mode,
+            hd_summary,
         )
 
         if verify:
-            _smoke_test(model, cache, originals, config, head_dim)
+            _smoke_test(model, cache, originals, config, unique_head_dims)
             cache.reset()
 
     return cache
