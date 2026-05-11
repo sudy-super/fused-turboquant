@@ -9,6 +9,12 @@ from fused_turboquant.core.hadamard import (
     randomized_hadamard,
 )
 from fused_turboquant.core.lloyd_max import CalibratedQuantizer, LloydMaxQuantizer
+from fused_turboquant.core.planar import (
+    PlanarQuantMSE,
+    PlanarRotation,
+    planar_rotate,
+    planar_rotate_inverse,
+)
 from fused_turboquant.core.quantizer import TurboQuantMSE
 
 __all__ = [
@@ -19,4 +25,8 @@ __all__ = [
     "LloydMaxQuantizer",
     "CalibratedQuantizer",
     "TurboQuantMSE",
+    "PlanarQuantMSE",
+    "PlanarRotation",
+    "planar_rotate",
+    "planar_rotate_inverse",
 ]

@@ -284,10 +284,11 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 def make_fused_attention_forward(
     attn_module,
     cache: CompressedKVCache,
-    quantizer: TurboQuantMSE,
+    quantizer,
     layer_idx: int,
     config=None,
     compress_v: bool = True,
+    quantizer_kind: str = "rht",
 ):
     """Create a replacement forward for an attention layer that uses fused TurboQuant.
 
@@ -295,7 +296,13 @@ def make_fused_attention_forward(
     fused forward closure.  Raises ValueError for unsupported features (fused
     QKV, sliding window, QK norm, logit softcapping, cross-attention) so that
     users get a clear error instead of silent garbage output.
+
+    `quantizer_kind` selects which rotation/attention kernel pair to use:
+        - "rht" (default): existing TurboQuantMSE (Randomized Hadamard Transform)
+        - "planar":        PlanarQuantMSE (per-pair 2D Givens rotation)
     """
+    if quantizer_kind not in ("rht", "planar"):
+        raise ValueError(f"quantizer_kind must be 'rht' or 'planar', got {quantizer_kind!r}")
     k_eq_v = False
     is_kv_shared = False
     if config is not None:
@@ -349,9 +356,29 @@ def make_fused_attention_forward(
                 layer_idx,
             )
 
-    from fused_turboquant.kernels.triton_attention import fused_qk_scores_rht
+    if quantizer_kind == "rht":
+        from fused_turboquant.core.hadamard import randomized_hadamard
+        from fused_turboquant.kernels.triton_attention import fused_qk_scores_rht
 
-    rht_signs = quantizer.rotation.signs
+        rotation_state = quantizer.rotation.signs
+
+        def _rotate_query(q_flat):
+            return randomized_hadamard(q_flat, rotation_state)
+
+        _qk_kernel = fused_qk_scores_rht
+    else:  # quantizer_kind == "planar"
+        from fused_turboquant.core.planar import planar_rotate
+        from fused_turboquant.kernels.triton_planar_attention import (
+            fused_qk_scores_planar,
+        )
+
+        rotation_state = quantizer.rotation.rot2
+
+        def _rotate_query(q_flat):
+            return planar_rotate(q_flat, rotation_state)
+
+        _qk_kernel = fused_qk_scores_planar
+
     centroids = quantizer.quantizer.levels
     head_dim = quantizer.head_dim
     bits = quantizer.bits
@@ -440,13 +467,11 @@ def make_fused_attention_forward(
         if q_len == 1:
             compressed = cache.get_compressed_key(layer_idx)
 
-            from fused_turboquant.core.hadamard import randomized_hadamard
-
             q_flat = query_states.float().reshape(-1, head_dim)
-            q_rot = randomized_hadamard(q_flat, rht_signs)
+            q_rot = _rotate_query(q_flat)
             q_rot = q_rot.view_as(query_states)
 
-            attn_weights = fused_qk_scores_rht(
+            attn_weights = _qk_kernel(
                 q_rot,
                 compressed["packed_indices"],
                 compressed["norms"],
@@ -836,6 +861,7 @@ def patch_model(
     quality_target: float | None = None,
     tokenizer=None,
     calibration_text: str | None = None,
+    quantizer_kind: str = "rht",
 ) -> CompressedKVCache:
     """Patch all full-attention layers in a model to use fused TurboQuant.
 
@@ -861,10 +887,26 @@ def patch_model(
         quality_target: (adaptive only) target mean cosine similarity (0-1).
         tokenizer: (adaptive only) tokenizer for calibration text.
         calibration_text: (adaptive only) custom calibration text.
+        quantizer_kind: which rotation-based quantizer to use:
+            - "rht" (default): TurboQuantMSE — Randomized Hadamard Transform
+              (O(d log d) butterfly). Requires power-of-2 head_dim.
+            - "planar": PlanarQuantMSE — per-pair 2D Givens rotation
+              (4 FMAs per pair, lighter rotation state). Requires even head_dim.
 
     Returns a CompressedKVCache to pass as past_key_values to model.generate().
     """
     config = _resolve_config(model)
+
+    if quantizer_kind not in ("rht", "planar"):
+        raise ValueError(
+            f"quantizer_kind must be 'rht' or 'planar', got {quantizer_kind!r}"
+        )
+
+    if quantizer_kind == "rht":
+        QuantizerCls = TurboQuantMSE
+    else:
+        from fused_turboquant.core.planar import PlanarQuantMSE
+        QuantizerCls = PlanarQuantMSE
 
     if bits not in (2, 3, 4):
         raise ValueError(
@@ -878,13 +920,22 @@ def patch_model(
     for name, module in model.named_modules():
         if _is_full_attention_layer(module, name):
             layer_hd = head_dim if head_dim is not None else _resolve_layer_head_dim(module, config)
-            if layer_hd < 1 or (layer_hd & (layer_hd - 1)) != 0:
-                raise ValueError(
-                    f"Layer {name}: head_dim={layer_hd} is not a power of 2. "
-                    f"TurboQuant requires power-of-2 head dimensions (64, 128, 256, 512, ...) "
-                    f"because the Randomized Hadamard Transform uses butterfly operations. "
-                    f"Use check_model_compatibility(model) for details."
-                )
+            if quantizer_kind == "rht":
+                if layer_hd < 1 or (layer_hd & (layer_hd - 1)) != 0:
+                    raise ValueError(
+                        f"Layer {name}: head_dim={layer_hd} is not a power of 2. "
+                        f"RHT-based TurboQuant requires power-of-2 head dimensions "
+                        f"(64, 128, 256, 512, ...) because the Hadamard butterfly "
+                        f"needs them. For non-power-of-2 even head_dims, pass "
+                        f"quantizer_kind='planar'."
+                    )
+            else:  # planar
+                if layer_hd < 2 or layer_hd % 2 != 0:
+                    raise ValueError(
+                        f"Layer {name}: head_dim={layer_hd} is not a positive even "
+                        f"integer. PlanarQuant needs an even head_dim because pairs "
+                        f"of adjacent coordinates are rotated jointly."
+                    )
             eligible_modules.append((name, module, layer_hd))
 
     if not eligible_modules and head_dim is None:
@@ -929,12 +980,12 @@ def patch_model(
         bit_map = calibrate_layer_bits(model, **cal_kwargs)
 
     default_bits = bits
-    tq_cache: dict[tuple[int, int], TurboQuantMSE] = {}
+    tq_cache: dict[tuple[int, int], object] = {}
 
-    def get_tq(b: int, hd: int) -> TurboQuantMSE:
+    def get_tq(b: int, hd: int):
         key = (hd, b)
         if key not in tq_cache:
-            tq_cache[key] = TurboQuantMSE(
+            tq_cache[key] = QuantizerCls(
                 head_dim=hd,
                 bits=b,
                 device=str(device),
@@ -971,6 +1022,7 @@ def patch_model(
             layer_idx,
             config=config,
             compress_v=layer_compress_v,
+            quantizer_kind=quantizer_kind,
         )
         patched += 1
 
@@ -1003,8 +1055,9 @@ def patch_model(
             else f"head_dims={unique_head_dims}"
         )
         logger.info(
-            "Patched %d attention layers with fused TurboQuant (%d-bit, %s compression, %s)",
+            "Patched %d attention layers with fused TurboQuant (kind=%s, %d-bit, %s compression, %s)",
             patched,
+            quantizer_kind,
             bits,
             kv_mode,
             hd_summary,
