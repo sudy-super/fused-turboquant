@@ -124,9 +124,15 @@ class FusedTurboQuantV1Backend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
 
     supported_dtypes: ClassVar[list] = [torch.float16, torch.bfloat16]
-    # Only TurboQuant cache dtypes — the boundary-protection raw fp16
-    # path is disabled at the engine level by the plugin.
+    # TurboQuant presets PLUS raw fp16 / bf16 for boundary-protection
+    # skip layers (default behavior: vLLM forces first/last 2 layers to
+    # `kv_cache_dtype="auto"` for accuracy). Those layers run through
+    # our raw fp16 SDPA fallback. Toggle with
+    # `TURBOQUANT_BOUNDARY_PROTECT` env var.
     supported_kv_cache_dtypes: ClassVar[list] = [
+        "auto",
+        "float16",
+        "bfloat16",
         "turboquant_k8v4",
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
@@ -157,20 +163,40 @@ class FusedTurboQuantV1Backend(AttentionBackend):
 
     @staticmethod
     def _slot_size_for(head_size: int, cache_dtype_str: str) -> int:
-        """How many bytes each (token, head) slot occupies, rounded up
-        to the next power of 2 so cross-layer page sizes stay in an
-        integer ratio. See plugin.py's spec rewriting.
+        """Last-dim element count for `get_kv_cache_shape`, rounded up
+        to the next power of 2.
+
+        The returned value is interpreted as the count of elements of
+        the spec's dtype (uint8 for TQ layers, bf16 for boundary-skip
+        layers). For both interpretations to fit in the same allocation
+        when boundary protection is enabled:
+
+          - TQ spec (dtype=uint8): need slot >= TQ slot bytes
+            (`slot_size_aligned`).
+          - Auto spec (dtype=bf16): need slot >= 2 * head_size
+            (i.e. `4*head_size` bytes / 2 bytes-per-element).
+
+        When boundary protection is disabled, only the TQ requirement
+        applies and the slot can be smaller (saving memory).
         """
+        from fused_turboquant.vllm_plugin.plugin import _boundary_protect_enabled
+
+        raw_fp16_elems = 2 * head_size  # bf16 element count for K+V
         if cache_dtype_str is not None and cache_dtype_str.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
-            raw = TurboQuantConfig.from_cache_dtype(
+            tq_raw = TurboQuantConfig.from_cache_dtype(
                 cache_dtype_str, head_size
             ).slot_size_aligned
+            raw = (
+                max(tq_raw, raw_fp16_elems)
+                if _boundary_protect_enabled()
+                else tq_raw
+            )
         else:
-            raw = 4 * head_size  # K bytes + V bytes (fp16)
+            raw = raw_fp16_elems
         if raw <= 1:
             return 1
         return 1 << (raw - 1).bit_length()
@@ -205,7 +231,15 @@ class FusedTurboQuantV1Backend(AttentionBackend):
 
     @classmethod
     def supports_attn_type(cls, attn_type) -> bool:
-        return attn_type == AttentionType.DECODER
+        # DECODER is the main case (all text decoder layers including
+        # boundary-skip raw fp16 layers). ENCODER / ENCODER_ONLY are
+        # accepted defensively for vision-tower attention if any model
+        # routes it through vLLM's Attention class (Gemma 4 doesn't).
+        return attn_type in (
+            AttentionType.DECODER,
+            AttentionType.ENCODER,
+            AttentionType.ENCODER_ONLY,
+        )
 
     @classmethod
     def supports_compute_capability(cls, capability) -> bool:
@@ -277,19 +311,26 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self.logits_soft_cap = logits_soft_cap
         self.attn_type = attn_type or AttentionType.DECODER
 
-        if not (
+        # `_is_raw` mode handles boundary-protection skip layers
+        # (`kv_cache_dtype="auto"` or fp16/bf16). Raw layers don't need a
+        # rotation strategy or any of the TQ state — they store K/V as
+        # fp16 bytes in the byte-indexed slot and SDPA on retrieval.
+        self._is_raw = not (
             isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_")
-        ):
-            raise ValueError(
-                f"FusedTurboQuantV1Impl only supports turboquant_* cache dtypes "
-                f"(got {kv_cache_dtype!r}). Boundary protection is disabled at "
-                f"the plugin level so every layer should arrive here as a TQ "
-                f"layer — if you see this, check "
-                f"`plugin._patch_disable_boundary_protection`."
+        )
+        if self._is_raw:
+            logger.info(
+                "FusedTurboQuantV1Impl init: raw fp16 fallback (kv_cache_dtype=%s, "
+                "boundary-protection layer). head_size=%d num_heads=%d "
+                "num_kv_heads=%d attn_type=%s sliding_window=%s",
+                kv_cache_dtype, head_size, num_heads, num_kv_heads,
+                self.attn_type, sliding_window,
             )
+            return
+
         if self.attn_type != AttentionType.DECODER:
             raise NotImplementedError(
-                f"FusedTurboQuantV1Impl only supports DECODER attention "
+                f"FusedTurboQuantV1Impl TQ path only supports DECODER attention "
                 f"(got {self.attn_type})."
             )
 
@@ -375,6 +416,13 @@ class FusedTurboQuantV1Impl(AttentionImpl):
     ) -> None:
         N = slot_mapping.shape[0]
         if N <= 0:
+            return
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return  # encoder attention has no persistent KV cache
+        if self._is_raw:
+            k = key[:N].view(N, self.num_kv_heads, self.head_size)
+            v = value[:N].view(N, self.num_kv_heads, self.head_size)
+            self._store_raw_kv(k, v, kv_cache, slot_mapping)
             return
         self._ensure_setup(layer, key.device)
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
@@ -464,6 +512,13 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         N = attn_metadata.num_actual_tokens
         if N <= 0:
             return output.fill_(0)
+
+        # Raw fp16 fallback for boundary-protection layers — bypasses
+        # rotation strategy and stock TQ kernels entirely.
+        if self._is_raw:
+            return self._forward_raw(
+                query, key, value, kv_cache, attn_metadata, output, N
+            )
 
         self._ensure_setup(layer, query.device)
 
@@ -746,6 +801,168 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         if self.fa_version is not None:
             kwargs["fa_version"] = self.fa_version
         return flash_attn_varlen_func(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Raw fp16 SDPA fallback (boundary-protection skip layers)
+    # ------------------------------------------------------------------
+
+    def _store_raw_kv(
+        self,
+        key: torch.Tensor,  # [N, num_kv_heads, head_size]
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write fp16 K and V into a byte-indexed slot.
+
+        kv_cache may arrive with dtype=uint8 (when the spec we patched
+        sets dtype=uint8) or with the spec's native dtype (bf16/fp16
+        for FullAttentionSpec). We normalize to a uint8 byte-view at
+        the top so the byte offsets below are dtype-independent.
+
+        Slot byte layout:
+            [0 .. 2*head_size)            K (fp16 bytes)
+            [2*head_size .. 4*head_size)  V (fp16 bytes)
+            [4*head_size .. slot)         padding
+        """
+        n_tokens = key.shape[0]
+        if n_tokens == 0:
+            return
+        kv_cache_u8 = (
+            kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
+        )
+        block_size = kv_cache_u8.shape[1]
+        head_size = self.head_size
+        k_bytes = v_bytes = 2 * head_size
+        k_fp16 = key.to(torch.float16).contiguous()
+        v_fp16 = value.to(torch.float16).contiguous()
+        k_u8 = k_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, k_bytes)
+        v_u8 = v_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, v_bytes)
+        slot_cpu = slot_mapping.tolist()
+        for i, slot in enumerate(slot_cpu):
+            if slot < 0:
+                continue
+            block_idx = slot // block_size
+            offset = slot % block_size
+            kv_cache_u8[block_idx, offset, :, :k_bytes] = k_u8[i]
+            kv_cache_u8[block_idx, offset, :, k_bytes : k_bytes + v_bytes] = v_u8[i]
+
+    def _gather_raw_kv(
+        self,
+        kv_cache: torch.Tensor,
+        block_table_row: torch.Tensor,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read full cached K/V for one sequence. Returns each as
+        `[1, num_kv_heads, seq_len, head_size]` fp16."""
+        kv_cache_u8 = (
+            kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
+        )
+        block_size = kv_cache_u8.shape[1]
+        head_size = self.head_size
+        k_bytes = v_bytes = 2 * head_size
+        n_blocks = (seq_len + block_size - 1) // block_size
+        k_parts, v_parts = [], []
+        for b in range(n_blocks):
+            block_idx = int(block_table_row[b].item())
+            tokens_here = min(block_size, seq_len - b * block_size)
+            block = kv_cache_u8[block_idx, :tokens_here]
+            k_u8 = block[:, :, :k_bytes].contiguous()
+            v_u8 = block[:, :, k_bytes : k_bytes + v_bytes].contiguous()
+            k_parts.append(
+                k_u8.view(torch.float16).reshape(tokens_here, self.num_kv_heads, head_size)
+            )
+            v_parts.append(
+                v_u8.view(torch.float16).reshape(tokens_here, self.num_kv_heads, head_size)
+            )
+        k = torch.cat(k_parts, dim=0).transpose(0, 1).unsqueeze(0).contiguous()
+        v = torch.cat(v_parts, dim=0).transpose(0, 1).unsqueeze(0).contiguous()
+        return k, v
+
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        """GQA expand: [b, num_kv_heads, s, d] → [b, num_heads, s, d]."""
+        if self.num_kv_groups == 1:
+            return x
+        b, h, s, d = x.shape
+        x = x[:, :, None, :, :].expand(b, h, self.num_kv_groups, s, d)
+        return x.reshape(b, h * self.num_kv_groups, s, d)
+
+    def _forward_raw(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+        N: int,
+    ) -> torch.Tensor:
+        """Plain SDPA per-sequence over raw fp16 K/V (no quantization)."""
+        q = query[:N].view(N, self.num_heads, self.head_size)
+        attn_out = torch.empty(
+            N, self.num_heads, self.head_size, dtype=q.dtype, device=q.device
+        )
+        query_start_loc = attn_metadata.query_start_loc.tolist()
+        seq_lens = attn_metadata.seq_lens.tolist()
+        block_table = attn_metadata.block_table
+
+        for i in range(len(seq_lens)):
+            q_s = query_start_loc[i]
+            q_e = query_start_loc[i + 1]
+            q_len = q_e - q_s
+            if q_len == 0:
+                continue
+            seq_len = seq_lens[i]
+            context_len = seq_len - q_len
+            q_i = q[q_s:q_e]
+            k_i = key[q_s:q_e].view(q_len, self.num_kv_heads, self.head_size)
+            v_i = value[q_s:q_e].view(q_len, self.num_kv_heads, self.head_size)
+
+            if self.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+                sub = self._sdpa_local(q_i, k_i, v_i, is_causal=False)
+            elif q_len > 1 and context_len == 0:
+                # First-chunk prefill
+                sub = self._sdpa_local(q_i, k_i, v_i, is_causal=True)
+            elif q_len > 1 and context_len > 0:
+                raise NotImplementedError(
+                    "Raw fp16 fallback: chunked prefill (context_len>0, "
+                    "q_len>1) is not supported."
+                )
+            else:
+                # Decode step
+                cached_k, cached_v = self._gather_raw_kv(
+                    kv_cache, block_table[i], seq_len
+                )
+                cached_k = cached_k.to(q_i.dtype)
+                cached_v = cached_v.to(q_i.dtype)
+                sub = self._sdpa_with_cached(q_i, cached_k, cached_v)
+            attn_out[q_s:q_e] = sub
+
+        if output.ndim == 3:
+            output[:N] = attn_out.to(output.dtype)
+        else:
+            output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+        return output
+
+    def _sdpa_local(self, q, k, v, is_causal: bool) -> torch.Tensor:
+        """SDPA on local (no-cache) Q/K/V. Returns `[q_len, num_heads, head_size]`."""
+        qt = q.unsqueeze(0).transpose(1, 2)  # [1, h, s, d]
+        kt = self._repeat_kv(k.unsqueeze(0).transpose(1, 2))
+        vt = self._repeat_kv(v.unsqueeze(0).transpose(1, 2))
+        out = F.scaled_dot_product_attention(
+            qt, kt, vt, scale=self.scale, is_causal=is_causal
+        )
+        return out.squeeze(0).transpose(0, 1).contiguous()
+
+    def _sdpa_with_cached(self, q, cached_k, cached_v) -> torch.Tensor:
+        """Decode SDPA over full cached K/V. q is `[1, num_heads, head_size]`."""
+        qt = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, 1, head_size]
+        kt = self._repeat_kv(cached_k)
+        vt = self._repeat_kv(cached_v)
+        out = F.scaled_dot_product_attention(
+            qt, kt, vt, scale=self.scale, is_causal=False
+        )
+        return out.squeeze(0).squeeze(1)  # [num_heads, head_size]
 
     # ------------------------------------------------------------------
     # Helpers
