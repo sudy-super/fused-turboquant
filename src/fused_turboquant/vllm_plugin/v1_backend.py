@@ -160,6 +160,29 @@ class FusedTurboQuantV1Backend(AttentionBackend):
 
         return TurboQuantMetadataBuilder
 
+    # (block_size, num_kv_heads, head_size, cache_dtype_str) -> overridden slot bytes
+    # populated by the unify shim when layers needed page_size_padded.
+    _slot_size_overrides: ClassVar[dict] = {}
+
+    @staticmethod
+    def _slot_size_for(head_size: int, cache_dtype_str: str) -> int:
+        """How many bytes each (token, head) slot occupies, before padding.
+
+        For TurboQuant presets this is `slot_size_aligned` from the preset's
+        config (K_packed + V_packed + alignment). For raw fp16/bf16 layers
+        we pack K and V into a single slot as `2 * head_size + 2 * head_size`
+        bytes so every layer can share the same (num_blocks, block_size,
+        num_kv_heads, slot_size) layout.
+        """
+        if cache_dtype_str is not None and cache_dtype_str.startswith("turboquant_"):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
+            return TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size).slot_size_aligned
+        # fp16 / bf16 raw: 2 bytes per element × (K head_size + V head_size).
+        return 4 * head_size
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -170,20 +193,21 @@ class FusedTurboQuantV1Backend(AttentionBackend):
     ) -> tuple:
         """Per-layer cache shape.
 
-        For TurboQuant presets we use vLLM's combined K+V slot layout (no
-        leading 2 dim) so the framework's TQFullAttentionSpec memory accounting
-        lines up. For `auto` / `float16` / `bfloat16` layers (e.g. vision
-        encoder) we fall back to the canonical (num_blocks, 2, block_size,
-        num_kv_heads, head_size) layout that every other backend produces.
+        Same 4-D layout for every layer (no leading 2 dim): K and V share one
+        slot of `slot_size_aligned` bytes. This lets us assign a single
+        `TQFullAttentionSpec` per layer so `unify_kv_cache_spec_page_size` only
+        has to compare scalar page sizes, and pad smaller ones via
+        `page_size_padded`. The shim in plugin._patch_kv_cache stamps the
+        unified slot size into `_slot_size_overrides` keyed by
+        (block_size, num_kv_heads, head_size, cache_dtype_str) so this shape
+        function returns a tensor whose .numel() matches the padded
+        page_size_bytes the spec reports.
         """
-        if cache_dtype_str is not None and cache_dtype_str.startswith("turboquant_"):
-            from vllm.model_executor.layers.quantization.turboquant.config import (
-                TurboQuantConfig,
-            )
-
-            tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
-            return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        key = (block_size, num_kv_heads, head_size, cache_dtype_str)
+        slot = FusedTurboQuantV1Backend._slot_size_overrides.get(key)
+        if slot is None:
+            slot = FusedTurboQuantV1Backend._slot_size_for(head_size, cache_dtype_str)
+        return (num_blocks, block_size, num_kv_heads, slot)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype) -> bool:
@@ -547,23 +571,40 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self,
         key: torch.Tensor,  # [n_tokens, num_kv_heads, head_size]
         value: torch.Tensor,
-        kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
+        kv_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, slot_size] uint8
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Write raw fp16/bf16 K and V into the canonical paged layout."""
+        """Write raw fp16/bf16 K and V into a 4-D combined-slot uint8 cache.
+
+        Slot byte layout (per (block, position, head)):
+            [0 .. 2*head_size)        K as fp16 bytes
+            [2*head_size .. 4*head_size)  V as fp16 bytes
+            [4*head_size .. slot_size)    padding (only present when the
+                                        unify shim widened this layer's slot)
+        """
         n_tokens = key.shape[0]
         if n_tokens == 0:
             return
-        block_size = kv_cache.shape[2]
-        cache_dtype = kv_cache.dtype
+        block_size = kv_cache.shape[1]
+        head_size = self.head_size
+        k_bytes = 2 * head_size
+        v_bytes = 2 * head_size
         slot_cpu = slot_mapping.tolist()
+        # Convert to fp16 once for the whole batch — vLLM's KV cache memory is
+        # always typed as uint8 for TQ slot layouts, so we view the fp16 tensor
+        # as bytes when writing.
+        k_fp16 = key.to(torch.float16).contiguous()
+        v_fp16 = value.to(torch.float16).contiguous()
+        # Reshape: [n_tokens, num_kv_heads, 2*head_size] uint8 view.
+        k_u8 = k_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, k_bytes)
+        v_u8 = v_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, v_bytes)
         for i, slot in enumerate(slot_cpu):
             if slot < 0:
                 continue
             block_idx = slot // block_size
             offset = slot % block_size
-            kv_cache[block_idx, 0, offset] = key[i].to(cache_dtype)
-            kv_cache[block_idx, 1, offset] = value[i].to(cache_dtype)
+            kv_cache[block_idx, offset, :, :k_bytes] = k_u8[i]
+            kv_cache[block_idx, offset, :, k_bytes : k_bytes + v_bytes] = v_u8[i]
 
     def forward(
         self,
@@ -700,7 +741,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
 
     def _gather_raw_kv(
         self,
-        kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
+        kv_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, slot_size] uint8
         block_table_row: torch.Tensor,
         seq_len: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -709,15 +750,24 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         Returns:
             K, V each shaped [1, num_kv_heads, seq_len, head_size]
         """
-        block_size = kv_cache.shape[2]
+        block_size = kv_cache.shape[1]
+        head_size = self.head_size
+        k_bytes = 2 * head_size
+        v_bytes = 2 * head_size
         n_blocks = (seq_len + block_size - 1) // block_size
 
         k_parts, v_parts = [], []
         for b in range(n_blocks):
             block_idx = int(block_table_row[b].item())
             tokens_here = min(block_size, seq_len - b * block_size)
-            k_parts.append(kv_cache[block_idx, 0, :tokens_here])
-            v_parts.append(kv_cache[block_idx, 1, :tokens_here])
+            block = kv_cache[block_idx, :tokens_here]  # [tokens, kv_heads, slot]
+            k_u8 = block[:, :, :k_bytes].contiguous()
+            v_u8 = block[:, :, k_bytes : k_bytes + v_bytes].contiguous()
+            # Interpret the uint8 bytes as fp16 (matches the write path).
+            k_fp16 = k_u8.view(torch.float16).reshape(tokens_here, self.num_kv_heads, head_size)
+            v_fp16 = v_u8.view(torch.float16).reshape(tokens_here, self.num_kv_heads, head_size)
+            k_parts.append(k_fp16)
+            v_parts.append(v_fp16)
         k = torch.cat(k_parts, dim=0)  # [seq_len, num_kv_heads, head_size]
         v = torch.cat(v_parts, dim=0)
         k = k.transpose(0, 1).unsqueeze(0).contiguous()
