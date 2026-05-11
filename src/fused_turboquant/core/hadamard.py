@@ -56,7 +56,14 @@ def inverse_fwht(x: torch.Tensor) -> torch.Tensor:
 def generate_rht_signs(d: int, seed: int = 0, device: torch.device | str = "cpu") -> torch.Tensor:
     """Generate deterministic random ±1 sign vector for RHT."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    signs = torch.randint(0, 2, (d,), generator=gen, dtype=torch.float32) * 2 - 1
+    # device="cpu" is explicit so we don't trip over a CUDA torch default
+    # device (vLLM sets torch.set_default_device("cuda") during engine init,
+    # which makes torch.randint with a CPU generator raise a device-type
+    # mismatch).
+    signs = (
+        torch.randint(0, 2, (d,), generator=gen, dtype=torch.float32, device="cpu") * 2
+        - 1
+    )
     return signs.to(device)
 
 
