@@ -61,7 +61,8 @@ def generate_planar_rot2(
     _validate_even(dim)
     n_groups = dim // 2
     gen = torch.Generator(device="cpu").manual_seed(seed)
-    angles = torch.rand(n_groups, generator=gen) * (2.0 * math.pi)
+    # device="cpu" explicit — see generate_rht_signs for why.
+    angles = torch.rand(n_groups, generator=gen, device="cpu") * (2.0 * math.pi)
     cos = angles.cos().to(torch.float32)
     sin = angles.sin().to(torch.float32)
     return torch.stack([cos, sin], dim=-1).to(device)

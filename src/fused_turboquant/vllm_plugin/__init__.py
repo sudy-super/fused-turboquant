@@ -23,3 +23,18 @@ Configuration (environment variables):
 from fused_turboquant.vllm_plugin.plugin import register_backend
 
 __all__ = ["register_backend"]
+
+# Auto-register when this subpackage is imported. vLLM child processes
+# (EngineCore) inherit the parent's site-packages but each one constructs
+# its own backend selector, so we need register_backend() to fire in every
+# process where the plugin is touched. The general_plugins entry point
+# fires the same function via importlib metadata, so calling it again here
+# is idempotent — vLLM's register_backend just overwrites the
+# AttentionBackendEnum.TURBOQUANT slot mapping.
+try:
+    register_backend()
+except Exception:
+    import logging
+    logging.getLogger(__name__).debug(
+        "auto-register failed (vLLM may not be installed)", exc_info=True
+    )
