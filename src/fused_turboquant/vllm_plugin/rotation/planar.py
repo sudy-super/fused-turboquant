@@ -25,7 +25,7 @@ import torch
 from fused_turboquant.core.planar import generate_planar_rot2
 
 from .base import register_rotation
-from .matrix import MatrixRotationStrategy
+from .matrix import BlockDiagonalRotationStrategy
 
 PLANAR_SEED = 42
 
@@ -53,8 +53,9 @@ def _build_planar_matrix(rot2: torch.Tensor) -> torch.Tensor:
     return M
 
 
-class PlanarStrategy(MatrixRotationStrategy):
+class PlanarStrategy(BlockDiagonalRotationStrategy):
     name = "planar"
+    block_size = 2
 
     def build_matrix(self, head_size, device):
         rot2 = generate_planar_rot2(head_size, seed=PLANAR_SEED, device=device).to(
