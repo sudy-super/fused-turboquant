@@ -1,6 +1,9 @@
 """
 Fused TurboQuant cache with compressed KV storage and fused attention.
 
+Set the env var ``TURBOQUANT_HF_FUSED_KV_STORE=0`` to disable the fused K+V
+encode path (useful for A/B benchmarking against the older per-tensor stores).
+
 Stores keys in compressed form (uint8 indices + fp32 norms) and computes
 Q @ K^T directly from compressed keys using our Triton fused attention kernel.
 Values are also compressed (packed indices + fp32 norms) and decompressed on
@@ -23,7 +26,13 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Optional
+
+
+def _fused_kv_store_enabled() -> bool:
+    """Toggle the K+V fused-encode path. Default ON; disable with env var=0."""
+    return os.environ.get("TURBOQUANT_HF_FUSED_KV_STORE", "1") != "0"
 
 import torch
 from transformers import DynamicCache
@@ -180,6 +189,38 @@ class CompressedKVCache(DynamicCache):
             return self._layer_tq_v[layer_idx]
         return self._layer_tq.get(layer_idx, self.tq)
 
+    # -- Append helper (shared by K, V, and the fused KV path) ----------------
+
+    @staticmethod
+    def _append_entry(
+        storage: list,
+        layer_idx: int,
+        packed: torch.Tensor,
+        norms: torch.Tensor,
+        source_shape,
+    ) -> None:
+        """Append a (packed_indices, norms) slice into `storage[layer_idx]`.
+
+        Handles the first-write (overwrite) and subsequent-write (concat along
+        the seq-len dim) cases. Centralizing this here keeps the cat logic
+        identical between the K-only, V-only, and fused KV paths.
+        """
+        packed_shape = list(source_shape[:-1]) + [packed.shape[-1]]
+        entry = {
+            "packed_indices": packed.view(packed_shape),
+            "norms": norms.view(*source_shape[:-1]),
+        }
+        if storage[layer_idx] is None:
+            storage[layer_idx] = entry
+            return
+        prev = storage[layer_idx]
+        storage[layer_idx] = {
+            "packed_indices": torch.cat(
+                [prev["packed_indices"], entry["packed_indices"]], dim=2
+            ),
+            "norms": torch.cat([prev["norms"], entry["norms"]], dim=2),
+        }
+
     # -- Key compression (packed uint8, unpacked inline by fused kernel) ------
 
     def store_compressed_key(self, key_states: torch.Tensor, layer_idx: int):
@@ -193,24 +234,13 @@ class CompressedKVCache(DynamicCache):
 
         tq = self.get_layer_quantizer(layer_idx)
         compressed = tq.encode(key_states.float())
-
-        packed_shape = list(key_states.shape[:-1]) + [compressed.indices.shape[-1]]
-        packed_indices = compressed.indices.view(packed_shape)
-        norms = compressed.norms.view(*key_states.shape[:-1])
-
-        entry = {"packed_indices": packed_indices, "norms": norms}
-
-        if self._compressed_keys[layer_idx] is None:
-            self._compressed_keys[layer_idx] = entry
-        else:
-            prev = self._compressed_keys[layer_idx]
-            self._compressed_keys[layer_idx] = {
-                "packed_indices": torch.cat(
-                    [prev["packed_indices"], entry["packed_indices"]],
-                    dim=2,
-                ),
-                "norms": torch.cat([prev["norms"], entry["norms"]], dim=2),
-            }
+        self._append_entry(
+            self._compressed_keys,
+            layer_idx,
+            compressed.indices,
+            compressed.norms,
+            key_states.shape,
+        )
 
     def get_compressed_key(self, layer_idx: int) -> Optional[dict]:
         if layer_idx < len(self._compressed_keys):
@@ -226,29 +256,79 @@ class CompressedKVCache(DynamicCache):
 
         tq = self.get_layer_quantizer_v(layer_idx)
         compressed = tq.encode(value_states.float())
-
-        packed_shape = list(value_states.shape[:-1]) + [compressed.indices.shape[-1]]
-        packed_indices = compressed.indices.view(packed_shape)
-        norms = compressed.norms.view(*value_states.shape[:-1])
-
-        entry = {"packed_indices": packed_indices, "norms": norms}
-
-        if self._compressed_values[layer_idx] is None:
-            self._compressed_values[layer_idx] = entry
-        else:
-            prev = self._compressed_values[layer_idx]
-            self._compressed_values[layer_idx] = {
-                "packed_indices": torch.cat(
-                    [prev["packed_indices"], entry["packed_indices"]],
-                    dim=2,
-                ),
-                "norms": torch.cat([prev["norms"], entry["norms"]], dim=2),
-            }
+        self._append_entry(
+            self._compressed_values,
+            layer_idx,
+            compressed.indices,
+            compressed.norms,
+            value_states.shape,
+        )
 
     def get_compressed_value(self, layer_idx: int) -> Optional[dict]:
         if layer_idx < len(self._compressed_values):
             return self._compressed_values[layer_idx]
         return None
+
+    # -- Fused K+V store (single encode kernel for both tensors) --------------
+
+    def store_compressed_kv(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+    ) -> None:
+        """Encode K and V with a single Triton kernel launch.
+
+        Mirrors vLLM's fused-store optimization: instead of two separate
+        `tq.encode()` calls per layer (one for K, one for V), we stack K and V
+        along a new leading dim and run one encode that processes
+        ``2 * batch * num_kv_heads * q_len`` vectors in a single kernel launch.
+        That doubles the per-launch parallelism and halves the launch overhead.
+
+        Falls back to two separate stores when the layer uses mixed-precision
+        K/V (different quantizers, different codebooks).
+        """
+        while len(self._compressed_keys) <= layer_idx:
+            self._compressed_keys.append(None)
+        while len(self._compressed_values) <= layer_idx:
+            self._compressed_values.append(None)
+
+        tq_k = self.get_layer_quantizer(layer_idx)
+        tq_v = self.get_layer_quantizer_v(layer_idx)
+
+        # Mixed K/V precision: codebooks differ, cannot fuse.
+        if tq_k is not tq_v:
+            self.store_compressed_key(key_states, layer_idx)
+            self.store_compressed_value(value_states, layer_idx)
+            return
+
+        # K and V must agree in shape for the stack to be meaningful — they
+        # always do in standard GQA modules, but assert to catch future drift.
+        if key_states.shape != value_states.shape:
+            self.store_compressed_key(key_states, layer_idx)
+            self.store_compressed_value(value_states, layer_idx)
+            return
+
+        stacked = torch.stack([key_states, value_states], dim=0).float()
+        compressed = tq_k.encode(stacked)
+
+        # `compressed.indices` is laid out [2, ..., packed_dim] and slicing
+        # the leading dim from a fresh stack returns a contiguous view, so the
+        # downstream attention/decode kernels don't pay a contiguous() copy.
+        self._append_entry(
+            self._compressed_keys,
+            layer_idx,
+            compressed.indices[0],
+            compressed.norms[0],
+            key_states.shape,
+        )
+        self._append_entry(
+            self._compressed_values,
+            layer_idx,
+            compressed.indices[1],
+            compressed.norms[1],
+            value_states.shape,
+        )
 
     def decode_values(self, layer_idx: int) -> torch.Tensor:
         """Decompress all cached value vectors for a layer.
@@ -472,9 +552,16 @@ def make_fused_attention_forward(
                 sin,
             )
 
-        cache.store_compressed_key(key_states, layer_idx)
-        if compress_v:
-            cache.store_compressed_value(value_states, layer_idx)
+        # Fused store: when both K and V are compressed, a single encode
+        # kernel processes them together (2x parallelism, half the launch
+        # overhead). Falls back to separate stores for K-only layers or when
+        # the env-var toggle disables fusion (A/B benchmarking).
+        if compress_v and _fused_kv_store_enabled():
+            cache.store_compressed_kv(key_states, value_states, layer_idx)
+        else:
+            cache.store_compressed_key(key_states, layer_idx)
+            if compress_v:
+                cache.store_compressed_value(value_states, layer_idx)
 
         # Pass minimal dummy slices to DynamicCache.update() for seq_length
         # bookkeeping. Full keys live in _compressed_keys, full values in
