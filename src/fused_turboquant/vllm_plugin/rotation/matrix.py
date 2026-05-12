@@ -39,3 +39,19 @@ class MatrixRotationStrategy(RotationStrategy):
 
     def rotate_for_decode(self, q, layer):
         return (q @ layer._fused_tq_rotation).contiguous()
+
+    def launch_store(self, key, value, kv_cache, slot_mapping, layer, tq_config):
+        """In-kernel matrix rotation: load `M` as a SRAM tile inside the
+        fused-store kernel and matmul there — no external cuBLAS GEMM."""
+        from fused_turboquant.vllm_plugin.triton_inkernel_store import _launch_matrix
+
+        _launch_matrix(
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping,
+            rotation_matrix=layer._fused_tq_rotation,
+            midpoints=self.get_midpoints(layer),
+            tq_config=tq_config,
+            head_size=key.shape[-1],
+        )

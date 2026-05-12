@@ -437,50 +437,21 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         slot_mapping: torch.Tensor,  # [N]
         layer,
     ) -> None:
-        from vllm.triton_utils import triton
-        from vllm.v1.attention.ops.triton_turboquant_store import (
-            _tq_fused_store_mse,
-        )
+        """Delegate to the rotation strategy's in-kernel fused store.
 
-        N, H, D = key.shape
-        NH = N * H
-        block_size = kv_cache.shape[1]
-        BLOCK_D = triton.next_power_of_2(D)
-        BLOCK_VAL = triton.next_power_of_2(self._val_data_bytes)
-        block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
-
-        # Normalize K, then rotate via strategy.
-        k_flat = key.float().reshape(NH, D)
-        norms = k_flat.norm(dim=1, keepdim=True)
-        x_hat = k_flat / (norms + 1e-8)
-        y = self.rotation.rotate_for_store(x_hat, layer)
-        v_flat = value.float().reshape(NH, D)
-
-        grid = (NH,)
-        _tq_fused_store_mse[grid](
-            y,
-            norms.squeeze(1),
-            v_flat,
-            self.rotation.get_midpoints(layer),
-            kv_cache.view(-1),
-            slot_mapping,
-            stride_cache_block=kv_cache.stride(0),
-            stride_cache_pos=kv_cache.stride(1),
-            stride_cache_head=kv_cache.stride(2),
-            D=D,
-            H=H,
-            BLOCK_SIZE=block_size,
-            BLOCK_D=BLOCK_D,
-            MSE_BYTES=self._mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=self._val_data_bytes,
-            BLOCK_VAL=BLOCK_VAL,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            N_CENTROIDS=self._n_centroids,
-            BLOCK_GRP=block_grp,
-            num_warps=4,
-            num_stages=1,
+        Each strategy supplies its own Triton kernel that does
+        normalization + rotation + bucketize/pack + V quant + slot
+        scatter in a single launch. The base-class fallback
+        (`RotationStrategy.launch_store`) handles strategies that don't
+        yet ship an in-kernel variant.
+        """
+        self.rotation.launch_store(
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping,
+            layer=layer,
+            tq_config=self.tq_config,
         )
 
     # ------------------------------------------------------------------
