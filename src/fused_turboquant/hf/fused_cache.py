@@ -907,6 +907,7 @@ def patch_model(
     calibration_text: str | None = None,
     quantizer_kind: str = "rht",
     v_bits: int | None = None,
+    boundary_protect: int = 0,
 ) -> CompressedKVCache:
     """Patch all full-attention layers in a model to use fused TurboQuant.
 
@@ -942,6 +943,16 @@ def patch_model(
             run mixed-precision K/V (e.g. `bits=4, v_bits=3` for 4-bit K +
             3-bit V — typical when K is more sensitive to quantization than
             V on the target model).
+        boundary_protect: Skip quantization on the first `n` and last `n`
+            attention layers (BOTH K and V), leaving them at fp16. Default
+            0 (no protection). Mirrors vLLM's boundary auto-skip
+            (`kv_cache_dtype_skip_layers`) and the `compress_v="boundary"`
+            preset — but `compress_v="boundary"` only skips V on the
+            boundary layers (K is still quantized), whereas
+            `boundary_protect=n` skips the layer ENTIRELY (K and V stay
+            fp16, no rotation, no Lloyd-Max). Set to 2 to match vLLM's
+            default. Useful for rotation kinds (Planar, Rotor, Iso) that
+            collapse on Gemma-style models without boundary protection.
 
     Returns a CompressedKVCache to pass as past_key_values to model.generate().
     """
@@ -961,6 +972,12 @@ def patch_model(
     if v_bits not in (2, 3, 4):
         raise ValueError(
             f"v_bits must be 2, 3, or 4 (or None), got {v_bits}."
+        )
+
+    if not isinstance(boundary_protect, int) or boundary_protect < 0:
+        raise ValueError(
+            f"boundary_protect must be a non-negative integer, got "
+            f"{boundary_protect!r}."
         )
 
     config = _resolve_config(model)
@@ -1060,11 +1077,31 @@ def patch_model(
     any_v = not isinstance(compress_v, bool) or compress_v
     cache = CompressedKVCache(primary_tq, compress_v=any_v)
 
+    # `boundary_protect=n` clamps to half the model so we never wrap past
+    # the middle. For a 4-layer model with `boundary_protect=3` we end up
+    # skipping every layer (i.e. effectively unpatched); the warning below
+    # catches that case.
+    n_boundary = min(boundary_protect, n_layers // 2)
+    if n_boundary > 0:
+        boundary_indices: set[int] = (
+            set(range(n_boundary)) | set(range(n_layers - n_boundary, n_layers))
+        )
+    else:
+        boundary_indices = set()
+
     patched = 0
+    boundary_skipped: list[int] = []
     originals = {}
     v_compressed_count = 0
 
     for layer_idx, (name, module, layer_hd) in enumerate(eligible_modules):
+        # Boundary protection: leave these layers entirely unpatched so
+        # they keep fp16 K and V (no rotation, no Lloyd-Max). Mirrors
+        # vLLM's `kv_cache_dtype_skip_layers` mechanism.
+        if layer_idx in boundary_indices:
+            boundary_skipped.append(layer_idx)
+            continue
+
         layer_bits = bit_map[layer_idx] if bit_map else default_bits
         layer_tq = get_tq(layer_bits, layer_hd)
         cache.set_layer_quantizer(layer_idx, layer_tq)
@@ -1090,6 +1127,16 @@ def patch_model(
             quantizer_kind=quantizer_kind,
         )
         patched += 1
+
+    if n_boundary > 0:
+        logger.info(
+            "fused-turboquant: boundary_protect=%d → skipped layers %s "
+            "(kept at fp16 K and V). Patched %d of %d eligible layers.",
+            n_boundary,
+            boundary_skipped,
+            patched,
+            n_layers,
+        )
 
     model._fused_tq_originals = originals
 
