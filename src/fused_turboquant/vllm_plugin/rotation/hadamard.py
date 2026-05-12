@@ -40,5 +40,22 @@ class HadamardStrategy(MatrixRotationStrategy):
     def build_matrix(self, head_size, device):
         return _build_hadamard(head_size, str(torch.device(device)))
 
+    def launch_store(self, key, value, kv_cache, slot_mapping, layer, tq_config):
+        """In-kernel FWHT (Sylvester butterfly) — skips the (D, D) matmul
+        entirely. The butterfly is O(D log D) FMAs with no random sign
+        flips, which is exactly what the Sylvester construction produces.
+        """
+        from fused_turboquant.vllm_plugin.triton_inkernel_store import _launch_rht
+
+        _launch_rht(
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping,
+            midpoints=self.get_midpoints(layer),
+            tq_config=tq_config,
+            head_size=key.shape[-1],
+        )
+
 
 register_rotation(HadamardStrategy.name, HadamardStrategy)
