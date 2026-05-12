@@ -413,6 +413,165 @@ def _launch_rht(
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Block-diagonal in-kernel rotation (Planar B=2, Rotor B=3, Iso B=4)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# These rotations have block-diagonal structure: M is zero outside the
+# B×B blocks along the diagonal. The generic (D, D) matmul above wastes
+# O(D²) FLOPs and HBM bandwidth on the off-block zeros; here we exploit
+# the structure to do only O(B·D) work per token.
+#
+# Storage per layer (vs (D, D) = D² floats):
+#   B=2: 2·D floats   (~64x smaller for D=128)
+#   B=3: 3·D floats   (3 × 128 = 384 vs 16384 for D=128)
+#   B=4: 4·D floats
+#
+# Algorithm:
+#   For each output position d:
+#       group       = d // B
+#       group_start = group * B
+#       y[d] = Σ_{k=0..B-1}  coeffs[k, d] * x_hat[group_start + k]
+#   where coeffs[k, d] = M[group_start + k, d] from the (D, D) matrix.
+#
+# Triton lacks efficient cross-lane permute, so the gather `x_hat[group_start + k]`
+# goes through HBM scratch — same trick as the RHT butterfly, but with
+# only B (not log2(D)) round-trips. For B=2/3/4 this is 2x–4x fewer
+# round-trips than RHT (which needs log2(128)=7 or log2(256)=8 stages).
+#
+# Coeff layout: [B, D] row-major. Loading `coeffs[k, *]` for a fixed k
+# is a contiguous read across `d_offs`, which coalesces perfectly.
+
+
+@triton.jit
+def _fused_store_block_diag(
+    Key_raw_ptr,      # [NH, D] float32
+    Value_ptr,        # [NH, D] float32
+    Coeffs_ptr,       # [B, D] float32 — precomputed block-rotation coefficients
+    Scratch_ptr,      # [NH, D] float32 — gather scratch
+    Midpoints_ptr,
+    KV_cache_ptr,
+    Slot_mapping_ptr,
+    stride_cache_block: tl.constexpr,
+    stride_cache_pos: tl.constexpr,
+    stride_cache_head: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    B: tl.constexpr,
+    MSE_BYTES: tl.constexpr,
+    KPS: tl.constexpr,
+    VQB: tl.constexpr,
+    VAL_DATA_BYTES: tl.constexpr,
+    BLOCK_VAL: tl.constexpr,
+    MSE_BITS: tl.constexpr,
+    N_CENTROIDS: tl.constexpr,
+    BLOCK_GRP: tl.constexpr = 16,
+):
+    """Block-diagonal in-kernel rotation: normalize → block-rotate via
+    B HBM scratch gathers → fused store."""
+    pid = tl.program_id(0)
+    slot, slot_base = _slot_base(
+        Slot_mapping_ptr, pid, H, BLOCK_SIZE,
+        stride_cache_block, stride_cache_pos, stride_cache_head,
+    )
+    if slot < 0:
+        return
+
+    base = pid * D
+    scratch_off = pid * D
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    # ── 0. Load raw K, compute norm, normalize ─────────────────────
+    k_raw = tl.load(Key_raw_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+    norm_sq = tl.sum(k_raw * k_raw, axis=0)
+    norm = tl.sqrt(norm_sq + 1e-16)
+    x_hat = k_raw / (norm + 1e-8)
+
+    # ── 1. Stage x_hat for cross-lane gather ───────────────────────
+    tl.store(Scratch_ptr + scratch_off + d_offs, x_hat, mask=d_mask)
+    tl.debug_barrier()
+
+    # ── 2. Block-wise rotation: y[d] = Σ_k coeffs[k, d] · x[group_start + k] ─
+    group_start = (d_offs // B) * B
+    y_vec = tl.zeros([BLOCK_D], dtype=tl.float32)
+    for k in tl.static_range(B):
+        partner_pos = group_start + k
+        partner_mask = (partner_pos < D) & d_mask
+        x_k = tl.load(
+            Scratch_ptr + scratch_off + partner_pos,
+            mask=partner_mask, other=0.0,
+        )
+        coeff_k = tl.load(
+            Coeffs_ptr + k * D + d_offs,
+            mask=d_mask, other=0.0,
+        )
+        y_vec = y_vec + x_k * coeff_k
+
+    # ── 3-6. Bucketize + pack + norm + V quant + slot scatter ──────
+    _bucketize_pack_norm_v_store(
+        y_vec, norm, Value_ptr, Midpoints_ptr, KV_cache_ptr,
+        base, slot_base, d_offs, d_mask,
+        D=D, BLOCK_D=BLOCK_D, MSE_BYTES=MSE_BYTES, KPS=KPS,
+        VQB=VQB, VAL_DATA_BYTES=VAL_DATA_BYTES, BLOCK_VAL=BLOCK_VAL,
+        MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, BLOCK_GRP=BLOCK_GRP,
+    )
+
+
+def _launch_block_diag(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    coeffs: torch.Tensor,   # [B, D] precomputed
+    midpoints: torch.Tensor,
+    tq_config,
+    head_size: int,
+    block_size: int,
+):
+    """Block-diagonal launcher (Planar B=2 / Rotor B=3 / Iso B=4)."""
+    N, H_kv, D = key.shape
+    NH = N * H_kv
+    cache_bs = kv_cache.shape[1]
+    BLOCK_D = triton.next_power_of_2(D)
+
+    mse_bytes = math.ceil(D * tq_config.key_mse_bits / 8)
+    n_centroids = 2 ** tq_config.key_mse_bits
+    val_data_bytes = math.ceil(D * tq_config.effective_value_quant_bits / 8)
+    BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
+    BLOCK_GRP = triton.next_power_of_2(D // 8) if D >= 8 else 1
+
+    k_flat = key.float().reshape(NH, D).contiguous()
+    v_flat = value.float().reshape(NH, D).contiguous()
+    scratch = torch.empty((NH, D), dtype=torch.float32, device=key.device)
+
+    grid = (NH,)
+    _fused_store_block_diag[grid](
+        k_flat, v_flat, coeffs, scratch, midpoints,
+        kv_cache.view(-1), slot_mapping,
+        stride_cache_block=kv_cache.stride(0),
+        stride_cache_pos=kv_cache.stride(1),
+        stride_cache_head=kv_cache.stride(2),
+        D=D,
+        H=H_kv,
+        BLOCK_SIZE=cache_bs,
+        BLOCK_D=BLOCK_D,
+        B=block_size,
+        MSE_BYTES=mse_bytes,
+        KPS=tq_config.key_packed_size,
+        VQB=tq_config.effective_value_quant_bits,
+        VAL_DATA_BYTES=val_data_bytes,
+        BLOCK_VAL=BLOCK_VAL,
+        MSE_BITS=tq_config.key_mse_bits,
+        N_CENTROIDS=n_centroids,
+        BLOCK_GRP=BLOCK_GRP,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
 def _launch_matrix(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -423,7 +582,7 @@ def _launch_matrix(
     tq_config,
     head_size: int,
 ):
-    """Generic matrix-rotation launcher (Planar / Rotor / Iso)."""
+    """Generic matrix-rotation launcher (fallback / debugging)."""
     N, H_kv, D = key.shape
     NH = N * H_kv
     block_size = kv_cache.shape[1]

@@ -56,7 +56,7 @@ import math
 import torch
 
 from .base import register_rotation
-from .matrix import MatrixRotationStrategy
+from .matrix import BlockDiagonalRotationStrategy
 
 ISO_SEED_QL = 42
 ISO_SEED_QR_OFFSET = 10000  # so q_R uses seed=42+10000 (matches rotorquant)
@@ -132,22 +132,27 @@ def _build_iso_matrix(head_size: int, device, full: bool) -> torch.Tensor:
     return M[:D, :D].to(torch.device(device)).contiguous()
 
 
-class IsoFastStrategy(MatrixRotationStrategy):
+class IsoFastStrategy(BlockDiagonalRotationStrategy):
     """IsoQuant-Fast: 4D block rotation via single quaternion left-multiply.
-    3 DOF per block, ~half the FLOPs of IsoQuant-Full."""
+    3 DOF per block, ~half the build-time FLOPs of IsoQuant-Full. At
+    runtime both use the same 4×4 block-diagonal kernel (4 gathers + 4
+    muladds per output dim)."""
 
     name = "iso_fast"
+    block_size = 4
 
     def build_matrix(self, head_size, device):
         return _build_iso_matrix(head_size, device, full=False)
 
 
-class IsoFullStrategy(MatrixRotationStrategy):
+class IsoFullStrategy(BlockDiagonalRotationStrategy):
     """IsoQuant-Full: 4D block rotation via quaternion sandwich `q_L · v · q̄_R`.
     6 DOF per block — the full SO(4) per group. Best quality among the
-    block-diagonal rotations (per the rotorquant Llama 3 PPL table)."""
+    block-diagonal rotations (per the rotorquant Llama 3 PPL table).
+    Runtime kernel identical to IsoQuant-Fast (same 4×4 structure)."""
 
     name = "iso_full"
+    block_size = 4
 
     def build_matrix(self, head_size, device):
         return _build_iso_matrix(head_size, device, full=True)

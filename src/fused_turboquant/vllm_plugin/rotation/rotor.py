@@ -54,7 +54,7 @@ import math
 import torch
 
 from .base import register_rotation
-from .matrix import MatrixRotationStrategy
+from .matrix import BlockDiagonalRotationStrategy
 
 ROTOR_SEED = 42
 
@@ -117,12 +117,13 @@ def _build_rotor_matrix(head_size: int, device) -> torch.Tensor:
     return M[:D, :D].to(torch.device(device)).contiguous()
 
 
-class RotorStrategy(MatrixRotationStrategy):
-    """RotorQuant via 3×3 block-diagonal rotation. Matmul-based, so
-    `x @ M` does the rotor sandwich (truncated to grade-1) in a single
-    cuBLAS call — same speed envelope as Planar."""
+class RotorStrategy(BlockDiagonalRotationStrategy):
+    """RotorQuant via 3×3 block-diagonal rotation. The block-diagonal
+    in-kernel path exploits the 3×3 structure: only 3 gathers + 3 muladds
+    per output dim, vs the dense kernel's D matmul."""
 
     name = "rotor"
+    block_size = 3
 
     def build_matrix(self, head_size, device):
         return _build_rotor_matrix(head_size, device)
