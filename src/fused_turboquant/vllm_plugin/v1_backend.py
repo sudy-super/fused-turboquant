@@ -766,25 +766,13 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self._ensure_fp16_prefix_buf(layer, device)
 
         # ── Phase 1: flash-attn SDPA over the FP16 prefix ──────────────
-        # Use vLLM's flash_attn_varlen_func with return_softmax_lse=True so
-        # the prefix attention runs on tensor cores (much faster than a
-        # naive matmul + softmax in PyTorch). We don't need causal masking
-        # here — the current decode token attends to ALL prefix positions.
         from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
         prefix_k_full = layer._fp16_prefix_k  # [capacity, Hk, D]
         prefix_v_full = layer._fp16_prefix_v
         prefix_capacity = layer._fp16_prefix_capacity
         prefix_len_t = layer._fp16_prefix_len_t  # GPU int32 [1]
-
-        # flash_attn_varlen_func expects (total_q, nheads, headdim).
         q_fa = query.to(prefix_k_full.dtype).contiguous()
-
-        # cu_seqlens must come from GPU tensors only (no Python-int writes)
-        # so this path is safe inside a captured CUDA graph. cu_q for our
-        # 1-token-per-seq decode is simply `arange(B+1) = [0, 1, ..., B]`,
-        # which we pre-allocate once at a max size and slice per call.
-        # cu_k = [0, prefix_len_t[0]] is constructed via a GPU→GPU copy.
         MAX_B = 64
         if not hasattr(self, "_cu_q_arange"):
             self._cu_q_arange = torch.arange(
@@ -796,27 +784,16 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         )
         cu_k.zero_()
         cu_k[1:].copy_(prefix_len_t.expand(B))
-
-        # max_seqlen_k is required to be a Python int (used for tile-count
-        # scheduling). We pass the buffer capacity as a safe upper bound;
-        # actual work is still bounded by cu_seqlens_k.
         fa_kwargs = dict(
-            q=q_fa,
-            k=prefix_k_full,
-            v=prefix_v_full,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=B,
-            max_seqlen_k=prefix_capacity,
-            softmax_scale=self.scale,
-            causal=False,
+            q=q_fa, k=prefix_k_full, v=prefix_v_full,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=B, max_seqlen_k=prefix_capacity,
+            softmax_scale=self.scale, causal=False,
             return_softmax_lse=True,
         )
         if self.fa_version is not None:
             fa_kwargs["fa_version"] = self.fa_version
         out_prefix, lse_prefix = flash_attn_varlen_func(**fa_kwargs)
-        # out_prefix: (B, Hq, D); lse_prefix: (Hq, B) per FA's convention —
-        # transpose to (B, Hq) to match our quantized-side LSE shape.
         if lse_prefix.dim() == 2 and lse_prefix.shape != (B, Hq):
             lse_prefix = lse_prefix.transpose(0, 1).contiguous()
 
