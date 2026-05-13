@@ -1177,9 +1177,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         q = query[:N].view(N, self.num_heads, self.head_size)
 
         # View the byte-layout slots as FP16 [K | V]. Requires the slot
-        # to be exactly 2*head_size FP16 elements (no padding). This
-        # holds for D ∈ {64, 128, 256, 512} (4*D is a power of 2, so
-        # `_slot_size_for` doesn't round up further when BP is on).
+        # to be exactly 2*head_size FP16 elements (no padding).
         head_size = self.head_size
         kv_u8 = (
             kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
@@ -1188,6 +1186,21 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         expected_bytes = 4 * head_size  # K_fp16 + V_fp16
         if slot_bytes != expected_bytes:
             # Padded slot — fall back to the per-sequence Python loop.
+            return self._forward_raw_python_loop(
+                query, key, value, kv_cache, attn_metadata, output, N
+            )
+
+        # head_size > 256 exceeds flash-attn-2's limit. For pure-decode
+        # batches we have a CUDA-graph-capturable alternative: gather a
+        # padded K/V tensor and run PyTorch SDPA (which supports any
+        # head_dim). For mixed / prefill batches we still have to fall
+        # back to the per-sequence Python loop.
+        if head_size > 256:
+            if (not attn_metadata.is_prefill
+                    and self.attn_type == AttentionType.DECODER):
+                return self._forward_raw_sdpa_paged(
+                    query, kv_cache, attn_metadata, output, N
+                )
             return self._forward_raw_python_loop(
                 query, key, value, kv_cache, attn_metadata, output, N
             )
@@ -1223,6 +1236,82 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         if self.fa_version is not None:
             kwargs["fa_version"] = self.fa_version
         attn_out = flash_attn_varlen_func(**kwargs)  # [N, num_heads, head_size]
+
+        if output.ndim == 3:
+            output[:N] = attn_out.to(output.dtype)
+        else:
+            output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+        return output
+
+    def _forward_raw_sdpa_paged(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+        N: int,
+    ) -> torch.Tensor:
+        """Pure-decode path that supports any head_size by using PyTorch
+        SDPA over a padded paged-cache gather. CUDA-graph capturable:
+        all shapes are static (max_blocks × block_size), with the
+        attention mask zeroing out positions past `seq_lens[i]`.
+
+        Memory cost: gathers `[B, max_blocks * block_size, num_kv_heads,
+        head_size]` FP16 per call, which can be tens of MB for long
+        contexts. Used only for boundary-protection layers with
+        head_size > 256 (e.g. Gemma 4 31B global layers).
+        """
+        B = attn_metadata.seq_lens.shape[0]
+        H_q = self.num_heads
+        H_k = self.num_kv_heads
+        D = self.head_size
+        device = query.device
+
+        q = query[:N].view(N, H_q, D).to(torch.float16)
+
+        kv_u8 = (
+            kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
+        )
+        block_size = kv_u8.shape[1]
+        block_table = attn_metadata.block_table  # [B, max_blocks]
+        max_blocks = block_table.shape[1]
+        max_kv = max_blocks * block_size
+
+        # Gather all blocks per sequence: [B, max_blocks, block_size, H_k, slot_bytes]
+        # Negative block ids are clamped to 0 — those positions are
+        # masked out by `seq_lens` below, so the garbage content is
+        # never used.
+        bt_safe = block_table.clamp(min=0)
+        selected = kv_u8[bt_safe]
+        selected_fp16 = selected.view(torch.float16).view(B, max_blocks, block_size, H_k, 2 * D)
+        k_all = selected_fp16[..., :D]
+        v_all = selected_fp16[..., D:]
+        k_all = k_all.reshape(B, max_kv, H_k, D)
+        v_all = v_all.reshape(B, max_kv, H_k, D)
+
+        # GQA expand on the head axis (Hq // Hk replicas of each KV head).
+        if H_q != H_k:
+            k_all = k_all.repeat_interleave(self.num_kv_groups, dim=2)
+            v_all = v_all.repeat_interleave(self.num_kv_groups, dim=2)
+
+        # SDPA wants [B, Hq, S, D]:
+        k_sdpa = k_all.transpose(1, 2)
+        v_sdpa = v_all.transpose(1, 2)
+        # q is [N, Hq, D] with N == B for pure decode; add a length-1 q
+        # axis.
+        q_sdpa = q.view(B, 1, H_q, D).transpose(1, 2)  # [B, Hq, 1, D]
+
+        # Build an attention mask that is True for positions < seq_lens[i].
+        positions = torch.arange(max_kv, device=device, dtype=attn_metadata.seq_lens.dtype)
+        mask = positions.unsqueeze(0) < attn_metadata.seq_lens.unsqueeze(1)  # [B, max_kv]
+        attn_mask = mask.view(B, 1, 1, max_kv)
+
+        out = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=attn_mask,
+            scale=self.scale,
+        )
+        attn_out = out.squeeze(2)  # [B, Hq, D]
 
         if output.ndim == 3:
             output[:N] = attn_out.to(output.dtype)
