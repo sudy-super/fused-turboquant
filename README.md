@@ -113,7 +113,7 @@ vLLM バックエンドには 3 つの独立した切り替えスイッチがあ
 | モード | 環境変数 / フラグ | 効果 | 推奨用途 |
 |---|---|---|---|
 | **CUDA graphs** | `enforce_eager=False` *(vLLM)* | decode 1 ステップごとの kernel 起動 overhead を償却 — 小型モデルで **decode 5〜14 倍**、30B+ で約 1.7 倍 | 本番では **常に ON** |
-| **Boundary protection (境界層保護)** | `TURBOQUANT_BOUNDARY_PROTECT=1` | 最初と最後の 2 層を FP16 で保持 (スロットの byte view 経由で paged flash-attn を実行)。精度向上と同時に、FP16 層が centroid lookup より速く attention できるため throughput も BP=0 を上回ることが多い。`defer_prefill` を CUDA graph で正しく動かすために **必須** | 圧縮率を限界まで詰めたい場合を除き **常に ON** |
+| **Boundary protection (境界層保護)** | `TURBOQUANT_BOUNDARY_PROTECT=1\|fp16\|2\|3\|4\|8` | 最初と最後の 2 層を **指定 bit 数で** 保持。`1` / `fp16` (デフォルト) = FP16 raw; `2`〜`4` / `8` = TQ 量子化の bit 数を上書き (slot は FP16 サイズ確保のままで余裕あり)。精度向上と同時に、上位 bit (FP16 / 8-bit) の層が centroid lookup より速く attention できるため throughput も BP=0 を上回ることが多い。`defer_prefill` を CUDA graph で正しく動かすために **必須** | 圧縮率を限界まで詰めたい場合を除き **常に ON** |
 | **Deferred FP16 K-cache (遅延 K キャッシュ量子化)** | `TURBOQUANT_DEFER_PREFILL=1` | prefill トークンの回転・量子化をスキップし、サイドバッファに FP16 のまま保持。decode 時に 2 段階 attention (FP16 prefix 上で flash-attn + 量子化領域上で offset-decode kernel、log-sum-exp で merge) を実行 | **長コンテキスト (prefix ≥ 4〜5K tokens) のみ**。それ未満では遅くなる (速度表参照) |
 | **回転種別** | `TURBOQUANT_KIND=rht\|planar\|rotor\|iso_fast\|iso_full` | MSE 量子化の前に適用する直交変換を選択。RHT (Walsh-Hadamard butterfly) が本番標準、Planar / Rotor / Iso はブロック対角型 (2×2 / 3×3 / 4×4) で各々 in-kernel 回転実装あり | 精度重視は RHT、rotorquant 論文派生は Planar / Iso |
 
@@ -204,6 +204,38 @@ llm = LLM(model="Qwen/Qwen2.5-3B-Instruct", dtype="bfloat16",
 - Lloyd-Max centroids は vLLM の `get_centroids(d, bits=2)` をそのまま使用 (4 levels)。
 - スロットの ceiling サイズはプリセット由来なので、override で bit 数を下げてもメモリ削減は **プリセット由来の slot 内** に閉じます (例: K=2 を 4-bit slot 上で動かすと 2-bit 分のデータ + 2-bit 分の未使用領域)。本当の memory saving が必要な場合は `kv_cache_dtype` を `turboquant_3bit_nc` 等小さい preset に。
 - FP8 keys (`turboquant_k8v4`) は v1 backend では未サポート (`turboquant_4bit_nc` / `k3v4_nc` / `3bit_nc` の 3 種から選択)。
+
+### 境界層保護の bit 数を指定する (FP16 以外の量子化で境界層を保護)
+
+境界層保護 (Boundary Protection) は従来「最初と最後の 2 層を FP16 で保持」する機能でしたが、`TURBOQUANT_BOUNDARY_PROTECT` を bit 数で指定すると **境界層を任意の bit 数で量子化** できます。FP16 (16-bit) より大幅にメモリ削減しつつ、中間層 (3-bit / 4-bit) より高精度に保つ、という中間の選択肢を得られます。
+
+| `TURBOQUANT_BOUNDARY_PROTECT` | 境界層の扱い | スロット使用バイト数 [bytes] (head_dim=128 時) |
+|---|---|---:|
+| `0` / `off` | 保護なし (全層中間層と同じ bit 数) | (中間層と同じ) |
+| `1` / `fp16` (既定) | 境界層を **FP16 raw** で保持。flash-attn / SDPA 経由 | 512 (4·D = K_fp16 + V_fp16) |
+| `2` | 境界層を **2-bit** TQ で保持 | 70 (32 K + 2 norm + 32 V + 4 V scale/zero) |
+| `3` | 境界層を **3-bit** TQ で保持 | 102 (48 K + 2 + 48 V + 4) |
+| `4` | 境界層を **4-bit** TQ で保持 | 134 (64 K + 2 + 64 V + 4) |
+| `8` | 境界層を **8-bit** TQ (256 levels MSE K + 256 levels uniform V) で保持 | 262 (128 K + 2 + 128 V + 4) |
+
+スロット自体は FP16-sized (= `4·head_dim` bytes) のまま確保されており、上記いずれの bit 数でも余裕で fit します (`head_dim=128` で 512 bytes 確保、最大の 8-bit 設定でも 262 bytes 使用)。残りは未使用領域。
+
+#### 使用例
+
+```bash
+# 境界層を 8-bit TQ で保護 (中間層は 4-bit のまま)
+TURBOQUANT_BOUNDARY_PROTECT=8 \
+vllm serve Qwen/Qwen2.5-3B-Instruct \
+  --attention-backend TURBOQUANT \
+  --kv-cache-dtype turboquant_4bit_nc
+```
+
+#### 実装メモ
+
+- 境界層は vLLM の `kv_cache_dtype_skip_layers` 機構によって `cache_dtype="auto"` (FP16 spec) で確保されます。境界層保護を bit 数指定にした場合も、**スロット自体は FP16-sized のまま**で、TQ kernels が先頭の数十〜数百バイトのみを使用します。残りは inert (読み書きされません)。
+- 8-bit boundary は 256 Lloyd-Max centroids + 256 levels uniform V。本リポジトリの fork 版 decode kernel に `VQB == 8` branch を追加して実装。`MSE_BITS == 8` 側は既存 kernel の汎用 bit-shift formula で自動的にカバーされます。
+- 2-bit / 3-bit / 4-bit boundary は既存の middle-layer 用の同 bit-width 経路を流用します。
+- `TURBOQUANT_KEY_BITS` / `TURBOQUANT_VALUE_BITS` (中間層用) は境界層には作用しません。境界層は `TURBOQUANT_BOUNDARY_PROTECT` の bit 数で決まります (K, V 同 bit のみ; K/V 個別指定は今後の課題)。
 
 補足:
 - 比較対象: [rotorquant](https://github.com/scrya-com/rotorquant) は llama.cpp 上の Qwen 2.5-3B planar3 で 119 tok/s と報告。本実装では同条件で 193 tok/s、19K トークン prefix でも 155 tok/s を維持します。
