@@ -14,6 +14,98 @@
 - 🤗 Drop-in **HuggingFace** integration and **vLLM** attention backend
 - 🔄 Auto-detects CUDA + Triton; falls back to unfused PyTorch on CPU
 
+## 📦 依存関係インストール
+
+```bash
+# HuggingFace 経由で使う場合
+pip install "fused-turboquant[cuda,hf]"
+
+# vLLM 経由で使う場合
+pip install "fused-turboquant[cuda,vllm]"
+
+# 両方
+pip install "fused-turboquant[cuda,hf,vllm]"
+```
+
+> ⚠️ `torch.cuda.is_available()` が `False` を返す環境では先に CUDA 版 PyTorch を入れてください: `pip install torch --index-url https://download.pytorch.org/whl/cu128`
+
+ソースからインストールする場合:
+
+```bash
+git clone https://github.com/Argonaut790/fused-turboquant.git
+cd fused-turboquant
+pip install -e ".[dev]"   # 開発依存も含めて editable install
+```
+
+## 🚀 Quick Start
+
+### 🤗 HuggingFace Transformers
+
+`patch_model` がモデルの全 attention 層に圧縮 KV キャッシュを差し込みます。RoPE / GQA は自動検出されます。
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from fused_turboquant.hf import patch_model
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-0.5B", device_map="auto"
+)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+
+# K+V を 4-bit で圧縮 (RHT 回転 + Lloyd-Max 量子化 + bit pack を 1 つの Triton カーネルに融合)
+cache = patch_model(model, bits=4)
+
+inputs = tokenizer("The capital of France is", return_tensors="pt").to(model.device)
+out = model.generate(
+    **inputs,
+    past_key_values=cache,
+    max_new_tokens=50,
+    use_cache=True,
+)
+print(tokenizer.decode(out[0], skip_special_tokens=True))
+```
+
+オプション (`patch_model` 引数):
+- `bits=3`: 圧縮率を 4.9 倍まで上げる (精度はやや低下)
+- `compress_v=False`: K のみ圧縮 (V は FP16)
+- `compress_v="boundary"`: 最初と最後の 2 層を FP16 のまま (精度優先)
+- `quantizer_kind="planar"` / `"rotor"` / `"iso_fast"` / `"iso_full"`: ブロック対角型回転 (デフォルト `"rht"`)
+
+### 🔌 vLLM
+
+Python API (オフラインバッチ推論):
+
+```python
+import os
+os.environ["TURBOQUANT_KIND"] = "rht"          # 回転種別 (rht/planar/rotor/iso_fast/iso_full)
+os.environ["TURBOQUANT_BOUNDARY_PROTECT"] = "1" # 推奨: 境界層保護を ON
+
+import fused_turboquant.vllm_plugin  # noqa: F401  (TURBOQUANT バックエンドを登録)
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen2.5-3B-Instruct",
+    dtype="bfloat16",
+    attention_backend="TURBOQUANT",
+    kv_cache_dtype="turboquant_4bit_nc",   # 4-bit K + 4-bit V
+    enforce_eager=False,                   # CUDA graphs ON (decode を 5–14 倍高速化)
+)
+sp = SamplingParams(max_tokens=128, temperature=0.0)
+out = llm.generate(["The capital of France is"], sp)
+print(out[0].outputs[0].text)
+```
+
+OpenAI 互換 API サーバとして起動する場合:
+
+```bash
+TURBOQUANT_KIND=rht TURBOQUANT_BOUNDARY_PROTECT=1 \
+vllm serve Qwen/Qwen2.5-3B-Instruct \
+  --attention-backend TURBOQUANT \
+  --kv-cache-dtype turboquant_4bit_nc
+```
+
+3-bit でさらに圧縮したい場合は `kv_cache_dtype="turboquant_3bit_nc"` または `turboquant_k3v4_nc` を指定。各モードの効果と推奨設定は [次節 (🎛️ vLLM 性能モード一覧)](#%EF%B8%8F-vllm-性能モード一覧) を参照。
+
 ## 🎛️ vLLM 性能モード一覧
 
 vLLM バックエンドには 3 つの独立した切り替えスイッチがあり、これらを組み合わせることで decode 速度・圧縮率・対応 prefix 長を調整できます。ワークロードに合った行を選んでください。
