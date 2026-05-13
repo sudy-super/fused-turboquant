@@ -14,41 +14,41 @@
 - 🤗 Drop-in **HuggingFace** integration and **vLLM** attention backend
 - 🔄 Auto-detects CUDA + Triton; falls back to unfused PyTorch on CPU
 
-## 🎛️ vLLM Performance Modes — at a Glance
+## 🎛️ vLLM 性能モード一覧
 
-Three orthogonal switches in the vLLM backend let you trade speed against compression and prefix length. Pick the row that matches your workload.
+vLLM バックエンドには 3 つの独立した切り替えスイッチがあり、これらを組み合わせることで decode 速度・圧縮率・対応 prefix 長を調整できます。ワークロードに合った行を選んでください。
 
-| Mode | env / flag | Effect | Best for |
+| モード | 環境変数 / フラグ | 効果 | 推奨用途 |
 |---|---|---|---|
-| **CUDA graphs** | `enforce_eager=False` *(vLLM)* | Amortizes the per-decode-step kernel-launch overhead — **5×–14× decode tok/s** for small models, ~1.7× for 30B+ | **Always on** in production |
-| **Boundary protection** | `TURBOQUANT_BOUNDARY_PROTECT=1` | Keeps the first/last 2 layers in FP16 (paged flash-attn over the byte-view of the slot). Both higher accuracy *and*, paradoxically, often higher throughput than BP=0 because the FP16 layers attend faster than the centroid-lookup path. **Required** for `defer_prefill` to be CUDA-graph-correct. | **Always on** unless you need every last byte of compression |
-| **Deferred FP16 K-cache** | `TURBOQUANT_DEFER_PREFILL=1` | Skips rotation/quantization on prefill tokens, stores them FP16 in a side buffer, then a 2-phase attention at decode time (flash-attn on the FP16 prefix + offset-decode kernel on the quantized region, merged via log-sum-exp). | **Long context (≥ 4–5K prefix)** only — *slower* below that, see speed table |
-| **Rotation kind** | `TURBOQUANT_KIND=rht\|planar\|rotor\|iso_fast\|iso_full` | Picks the orthogonal mixer applied before MSE quantization. RHT (Walsh-Hadamard butterfly) ships in production; Planar / Rotor / Iso are block-diagonal variants (2×2 / 3×3 / 4×4) with their own fused in-kernel rotation. | RHT for max accuracy, Planar/Iso for the rotorquant-paper variants |
+| **CUDA graphs** | `enforce_eager=False` *(vLLM)* | decode 1 ステップごとの kernel 起動 overhead を償却 — 小型モデルで **decode 5〜14 倍**、30B+ で約 1.7 倍 | 本番では **常に ON** |
+| **Boundary protection (境界層保護)** | `TURBOQUANT_BOUNDARY_PROTECT=1` | 最初と最後の 2 層を FP16 で保持 (スロットの byte view 経由で paged flash-attn を実行)。精度向上と同時に、FP16 層が centroid lookup より速く attention できるため throughput も BP=0 を上回ることが多い。`defer_prefill` を CUDA graph で正しく動かすために **必須** | 圧縮率を限界まで詰めたい場合を除き **常に ON** |
+| **Deferred FP16 K-cache (遅延 K キャッシュ量子化)** | `TURBOQUANT_DEFER_PREFILL=1` | prefill トークンの回転・量子化をスキップし、サイドバッファに FP16 のまま保持。decode 時に 2 段階 attention (FP16 prefix 上で flash-attn + 量子化領域上で offset-decode kernel、log-sum-exp で merge) を実行 | **長コンテキスト (prefix ≥ 4〜5K tokens) のみ**。それ未満では遅くなる (速度表参照) |
+| **回転種別** | `TURBOQUANT_KIND=rht\|planar\|rotor\|iso_fast\|iso_full` | MSE 量子化の前に適用する直交変換を選択。RHT (Walsh-Hadamard butterfly) が本番標準、Planar / Rotor / Iso はブロック対角型 (2×2 / 3×3 / 4×4) で各々 in-kernel 回転実装あり | 精度重視は RHT、rotorquant 論文派生は Planar / Iso |
 
-### Recommended setup per workload
+### ワークロード別 推奨設定
 
-| Workload | `enforce_eager` | `TURBOQUANT_BOUNDARY_PROTECT` | `TURBOQUANT_DEFER_PREFILL` |
+| ワークロード | `enforce_eager` | `TURBOQUANT_BOUNDARY_PROTECT` | `TURBOQUANT_DEFER_PREFILL` |
 |---|---|---|---|
-| Short chat (≤ 4K prefix) — **default** | `False` | `1` | `0` |
-| Long-context RAG / agent (≥ 5K prefix) | `False` | `1` | `1` |
-| Max compression / accept slow decode | `False` | `0` | `0` |
+| 短い chat (prefix ≤ 4K tokens) — **既定** | `False` | `1` | `0` |
+| 長コンテキスト RAG / agent (prefix ≥ 5K tokens) | `False` | `1` | `1` |
+| 圧縮率優先 / decode が遅くてもよい場合 | `False` | `0` | `0` |
 
-### Measured decode speedups (Qwen 2.5-3B-Instruct, RTX PRO 6000)
+### 実測 decode 速度 (Qwen 2.5-3B-Instruct, RTX PRO 6000, planar)
 
-Per-step decode throughput across the same model with each switch toggled. Bold = recommended default.
+各設定を切り替えたときの decode スループットを示します。プロンプト長は **入力トークン数 (tokens)**、表中の数値は **decode ステップあたりのトークン生成速度 (tok/s)** です。**太字** は各行の最速設定。
 
-| Prefix | Eager + BP=0 | + CUDA graphs | + BP=1 | + defer (BP=1) |
+| プロンプト長 [tokens] | Eager + BP=0 [tok/s] | + CUDA graphs [tok/s] | + BP=1 [tok/s] | + defer (BP=1) [tok/s] |
 |---:|---:|---:|---:|---:|
-| 181 tok | 35.5 | 194.7 | **193.2** | 157.7 |
-| 1,201 tok | 22.5 | 181.8 | **181.8** | 157.1 |
-| 4,801 tok | 10.4 | 147.4 | 150.2 | **155.3** |
-| 19,201 tok | 38.6 | 88.7 | 93.8 | **155.6** |
+| 181 | 35.5 | 194.7 | **193.2** | 157.7 |
+| 1,201 | 22.5 | 181.8 | **181.8** | 157.1 |
+| 4,801 | 10.4 | 147.4 | 150.2 | **155.3** |
+| 19,201 | 38.6 | 88.7 | 93.8 | **155.6** |
 
-Notes:
-- For comparison: [rotorquant](https://github.com/scrya-com/rotorquant) reports 119 tok/s on llama.cpp for Qwen 2.5-3B planar3 — we hit 193 tok/s on the equivalent setup, and 155 tok/s even at a 19K-token prefix.
-- `TURBOQUANT_DEFER_PREFILL=1` requires `TURBOQUANT_BOUNDARY_PROTECT=1` for CUDA-graph capture to produce correct output (BP=0 + defer + cudagraph silently corrupts output — the dispatch is mismatched at capture).
-- The deferred FP16 prefix path uses memory: a `[max_model_len, num_kv_heads, head_size]` FP16 buffer per layer, in addition to the quantized paged cache.
-- For models with `head_size > 256` (e.g. Gemma 4 31B global layers), the boundary-protection path falls back from flash-attn to a CUDA-graph-safe SDPA gather; CUDA graphs still work but the per-step overhead is higher (~1.7× over eager, not 5×+).
+補足:
+- 比較対象: [rotorquant](https://github.com/scrya-com/rotorquant) は llama.cpp 上の Qwen 2.5-3B planar3 で 119 tok/s と報告。本実装では同条件で 193 tok/s、19K トークン prefix でも 155 tok/s を維持します。
+- `TURBOQUANT_DEFER_PREFILL=1` を使うには `TURBOQUANT_BOUNDARY_PROTECT=1` が必要です。BP=0 + defer + cudagraph はクラッシュせず動きますが、capture 時のディスパッチが不一致のため出力が無音で壊れます。
+- defer 経路は層ごとに `[max_model_len, num_kv_heads, head_size]` の FP16 サイドバッファを確保するため、量子化 paged cache に加えてメモリを消費します。
+- `head_size > 256` のモデル (例: Gemma 4 31B のグローバル層) では境界層が flash-attn ではなく CUDA graph 安全な SDPA gather に fallback します。CUDA graphs 自体は動きますが、eager 比の高速化倍率は ~1.7 倍 (5×+ ではなく) になります。
 
 ## 📦 Installation
 
