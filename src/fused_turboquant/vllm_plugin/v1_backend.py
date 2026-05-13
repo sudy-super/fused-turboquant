@@ -365,6 +365,45 @@ class FusedTurboQuantV1Impl(AttentionImpl):
                 "turboquant_k3v4_nc."
             )
 
+        # Independent K / V bit-width override via env vars. vLLM's
+        # CacheDType Literal only ships 3 quantized presets ({K=4,V=4},
+        # {K=3,V=4}, {K=3,V=3}), so to expose all 9 of K, V ∈ {2, 3, 4}
+        # without modifying vLLM we treat the preset as the *slot
+        # allocation* and let TURBOQUANT_KEY_BITS / TURBOQUANT_VALUE_BITS
+        # override the *effective* quantization width. Override bits
+        # must be ≤ the preset's bits — pick the smallest preset whose
+        # K, V slots fit the desired widths (`turboquant_4bit_nc` is a
+        # safe maximal choice).
+        key_override = os.environ.get("TURBOQUANT_KEY_BITS")
+        val_override = os.environ.get("TURBOQUANT_VALUE_BITS")
+        if key_override is not None or val_override is not None:
+            preset_k = self.tq_config.key_quant_bits
+            preset_v = self.tq_config.value_quant_bits
+            new_k = int(key_override) if key_override is not None else preset_k
+            new_v = int(val_override) if val_override is not None else preset_v
+            if not (2 <= new_k <= 4) or not (2 <= new_v <= 4):
+                raise ValueError(
+                    f"TURBOQUANT_KEY_BITS / TURBOQUANT_VALUE_BITS must be in "
+                    f"{{2, 3, 4}}; got K={new_k}, V={new_v}."
+                )
+            if new_k > preset_k or new_v > preset_v:
+                raise ValueError(
+                    f"Override (K={new_k}, V={new_v}) exceeds preset slot "
+                    f"capacity (preset {kv_cache_dtype}: K={preset_k}, "
+                    f"V={preset_v}). Pick a larger preset such as "
+                    f"turboquant_4bit_nc and override down from there."
+                )
+            self.tq_config = TurboQuantConfig(
+                head_dim=head_size,
+                key_quant_bits=new_k,
+                value_quant_bits=new_v,
+                norm_correction=self.tq_config.norm_correction,
+            )
+            logger.info(
+                "TURBOQUANT bit-width override: K=%d, V=%d (preset slot was K=%d, V=%d)",
+                new_k, new_v, preset_k, preset_v,
+            )
+
         kind = _env_str("TURBOQUANT_KIND", "rht")
         try:
             self.rotation: RotationStrategy = get_rotation(kind)
@@ -428,8 +467,23 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         """Ask the rotation strategy to materialize its state on the
         layer the first time we see it. `layer._tq_centroids` is the
         Lloyd-Max level table that vLLM's `Attention._init_turboquant_buffers`
-        already attached.
+        already attached — but vLLM computes it for the preset's
+        `key_mse_bits`, not our possibly-overridden bits. If the override
+        changes the K bit-width (and thus the centroid count), regenerate
+        the table here before the rotation strategy caches midpoints.
         """
+        expected_n = 2 ** self.tq_config.key_mse_bits
+        if layer._tq_centroids.shape[0] != expected_n:
+            from vllm.model_executor.layers.quantization.turboquant.centroids import (
+                get_centroids,
+            )
+            layer._tq_centroids = get_centroids(
+                d=self.head_size, bits=self.tq_config.key_mse_bits
+            ).to(device=device, dtype=torch.float32)
+            # Invalidate any rotation-strategy-side cache so midpoints
+            # are regenerated against the new centroid table.
+            if getattr(layer, "_fused_tq_cached", False):
+                layer._fused_tq_cached = False
         self.rotation.setup_layer(layer, self.head_size, layer._tq_centroids, device)
         # Eager-allocate the deferred-prefill side buffers so vLLM's
         # CUDA-graph capture dummy run sees the hybrid path (and not the
@@ -631,6 +685,16 @@ class FusedTurboQuantV1Impl(AttentionImpl):
                 query, kv_cache, attn_metadata, layer
             )
 
+        # 2-bit K or V: vLLM's stock `_tq_decode_stage1` doesn't ship 2-bit
+        # K/V unpacking branches. Route through our forked offset kernel
+        # (which we extended), with kv_start_offset=0 so it iterates the
+        # full sequence — same semantics as stock stage1 for non-defer.
+        if (self.tq_config.key_mse_bits == 2
+                or self.tq_config.effective_value_quant_bits == 2):
+            return self._decode_attention_offset_only(
+                query, kv_cache, attn_metadata, layer
+            )
+
         from vllm.triton_utils import triton
         from vllm.v1.attention.ops.triton_turboquant_decode import (
             _tq_decode_stage1,
@@ -726,6 +790,118 @@ class FusedTurboQuantV1Impl(AttentionImpl):
     # ------------------------------------------------------------------
     # Hybrid decode: FP16 SDPA on prefix + quantized kernel on the rest
     # ------------------------------------------------------------------
+
+    def _decode_attention_offset_only(
+        self,
+        query: torch.Tensor,  # [B, Hq, D]
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        layer,
+    ) -> torch.Tensor:
+        """Run only our forked offset stage1 + stage2 (no FA prefix phase).
+
+        Used when there is no FP16 prefix to merge — e.g. for 2-bit K / V
+        modes where we need our extended kernel's unpacking branches.
+        Equivalent semantics to vLLM's stock `_tq_decode_stage1` but
+        routed through our fork so the 2-bit branches are reachable.
+        """
+        from vllm.triton_utils import triton
+        from vllm.v1.attention.ops.triton_decode_attention import (
+            _fwd_kernel_stage2,
+        )
+        from fused_turboquant.vllm_plugin.triton_decode_offset import (
+            _tq_decode_stage1_offset,
+            _use_fp8_e4b15,
+        )
+
+        B, Hq, D = query.shape
+        Hk = kv_cache.shape[2]
+        block_size = kv_cache.shape[1]
+        kv_group_size = Hq // Hk
+        device = query.device
+
+        q_rot = self.rotation.rotate_for_decode(query.float(), layer)
+        BLOCK_D = triton.next_power_of_2(D)
+        NUM_KV_SPLITS = self.max_num_kv_splits
+
+        mid_o = self._get_or_alloc_buf(
+            layer, "_fused_mid_o", (B, Hq, NUM_KV_SPLITS, D + 1),
+            dtype=torch.float32, device=device,
+        )
+        output = self._get_or_alloc_buf(
+            layer, "_fused_output", (B, Hq, D),
+            dtype=torch.float32, device=device,
+        )
+        lse = self._get_or_alloc_buf(
+            layer, "_fused_lse", (B, Hq), dtype=torch.float32, device=device,
+        )
+
+        # kv_start_offset = 0 (no FP16 prefix): pre-alloc once on `self`.
+        kv_start_offset = self._get_or_alloc_buf(
+            self, "_kv_start_zero", (B,),
+            dtype=attn_metadata.seq_lens.dtype, device=device,
+        )
+        kv_start_offset.zero_()
+
+        fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
+        BLOCK_KV = 4
+        grid1 = (B, Hq, NUM_KV_SPLITS)
+        _tq_decode_stage1_offset[grid1](
+            q_rot,
+            kv_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            kv_start_offset,
+            self.rotation.get_centroids(layer),
+            mid_o,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            attn_metadata.block_table.stride(0),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            NUM_KV_HEADS=Hk,
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            KV_GROUP_SIZE=kv_group_size,
+            MSE_BITS=self.tq_config.key_mse_bits,
+            MSE_BYTES=self._mse_bytes,
+            KPS=self.tq_config.key_packed_size,
+            VQB=self.tq_config.effective_value_quant_bits,
+            VAL_DATA_BYTES=self._val_data_bytes,
+            ATTN_SCALE=self.scale,
+            BLOCK_D=BLOCK_D,
+            BLOCK_KV=BLOCK_KV,
+            KEY_FP8=0,
+            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+            FP8_E4B15=fp8_e4b15,
+            num_warps=1,
+            num_stages=1,
+        )
+
+        grid2 = (B, Hq)
+        _fwd_kernel_stage2[grid2](
+            mid_o,
+            output,
+            lse,
+            attn_metadata.seq_lens,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            BLOCK_DV=BLOCK_D,
+            Lv=D,
+            num_warps=4,
+            num_stages=2,
+        )
+        return output.to(query.dtype)
 
     def _decode_attention_hybrid(
         self,
