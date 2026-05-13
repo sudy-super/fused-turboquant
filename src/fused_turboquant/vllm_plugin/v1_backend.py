@@ -311,6 +311,20 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self.logits_soft_cap = logits_soft_cap
         self.attn_type = attn_type or AttentionType.DECODER
 
+        # Deferred FP16 K-cache for prefix attention (rotorquant-style).
+        # When enabled:
+        #   - Prefill writes K/V to a per-layer FP16 side buffer (skips the
+        #     rotation+quantize store kernel entirely).
+        #   - Decode attention runs two phases:
+        #       Phase 1: fp16 SDPA over the buffered prefix (fast, no dequant)
+        #       Phase 2: stock decode kernel over the quantized decode region
+        #     merged via log-sum-exp.
+        #   - New decode tokens are quantized into the paged cache as usual.
+        # Net: attention on the long prefix avoids centroid-lookup overhead.
+        self.defer_prefill = (
+            os.environ.get("TURBOQUANT_DEFER_PREFILL", "0") == "1"
+        )
+
         # `_is_raw` mode handles boundary-protection skip layers
         # (`kv_cache_dtype="auto"` or fp16/bf16). Raw layers don't need a
         # rotation strategy or any of the TQ state — they store K/V as
@@ -427,6 +441,19 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self._ensure_setup(layer, key.device)
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
+
+        if self.defer_prefill and N > 1:
+            # Deferred FP16 K-cache: skip the rotation+quantize store kernel
+            # entirely; just stash a FP16 copy on the layer for the decode
+            # path to do fast SDPA against. NOTE: single-sequence assumption —
+            # we overwrite the buffer per prefill, so batch > 1 prefills will
+            # clobber each other. Sufficient for benchmarking; production use
+            # needs per-sequence indexing.
+            layer._fp16_prefix_k = k.to(torch.float16).contiguous()
+            layer._fp16_prefix_v = v.to(torch.float16).contiguous()
+            layer._fp16_prefix_len = N
+            return
+
         self._launch_store(k, v, kv_cache, slot_mapping, layer)
 
     def _launch_store(
@@ -545,6 +572,15 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         attn_metadata,
         layer,
     ) -> torch.Tensor:
+        # Hybrid path: if there's a deferred-prefill FP16 prefix on this
+        # layer, run two-phase attention (FP16 SDPA on prefix + quantized
+        # decode kernel on the rest) and merge via log-sum-exp.
+        prefix_len = getattr(layer, "_fp16_prefix_len", 0)
+        if self.defer_prefill and prefix_len > 0:
+            return self._decode_attention_hybrid(
+                query, kv_cache, attn_metadata, layer, prefix_len
+            )
+
         from vllm.triton_utils import triton
         from vllm.v1.attention.ops.triton_turboquant_decode import (
             _tq_decode_stage1,
@@ -636,6 +672,185 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             num_stages=2,
         )
         return output.to(query.dtype)
+
+    # ------------------------------------------------------------------
+    # Hybrid decode: FP16 SDPA on prefix + quantized kernel on the rest
+    # ------------------------------------------------------------------
+
+    def _decode_attention_hybrid(
+        self,
+        query: torch.Tensor,  # [B, Hq, D]
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        layer,
+        prefix_len: int,
+    ) -> torch.Tensor:
+        """Two-phase attention with deferred FP16 prefix.
+
+        Phase 1: SDPA(Q, K_fp16_prefix, V_fp16_prefix) → out_p, lse_p
+                 (the prefix never went through rotate/quantize, so we
+                 use the *original* K — no Q rotation here).
+        Phase 2: stock decode kernel over the quantized [prefix_len, seq_len)
+                 region, using a rotated Q against rotated centroids.
+        Merge:   out = softmax-merge by log-sum-exp.
+
+        The two phases use different Qs (raw vs rotated), but because R
+        is orthogonal `Q · K_orig = (R·Q) · (R·K_orig)`, the scores
+        produced in each phase live on the same scale, so the LSE merge
+        is mathematically exact (modulo quantization noise on phase 2).
+        """
+        from vllm.triton_utils import triton
+        from vllm.v1.attention.ops.triton_decode_attention import (
+            _fwd_kernel_stage2,
+        )
+        from fused_turboquant.vllm_plugin.triton_decode_offset import (
+            _tq_decode_stage1_offset,
+            _use_fp8_e4b15,
+        )
+
+        B, Hq, D = query.shape
+        Hk = kv_cache.shape[2]
+        block_size = kv_cache.shape[1]
+        kv_group_size = Hq // Hk
+        device = query.device
+
+        # ── Phase 1: flash-attn SDPA over the FP16 prefix ──────────────
+        # Use vLLM's flash_attn_varlen_func with return_softmax_lse=True so
+        # the prefix attention runs on tensor cores (much faster than a
+        # naive matmul + softmax in PyTorch). We don't need causal masking
+        # here — the current decode token attends to ALL prefix positions.
+        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+        prefix_k = layer._fp16_prefix_k  # [prefix_len, Hk, D]
+        prefix_v = layer._fp16_prefix_v
+        # flash_attn_varlen_func expects (total_q, nheads, headdim).
+        # query is already in [B, Hq, D] = (total_q=B, nheads=Hq, D).
+        q_fa = query.to(prefix_k.dtype).contiguous()
+        cu_q = torch.tensor([0, B], dtype=torch.int32, device=device)
+        cu_k = torch.tensor([0, prefix_len], dtype=torch.int32, device=device)
+
+        fa_kwargs = dict(
+            q=q_fa,
+            k=prefix_k,
+            v=prefix_v,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=B,
+            max_seqlen_k=prefix_len,
+            softmax_scale=self.scale,
+            causal=False,
+            return_softmax_lse=True,
+        )
+        if self.fa_version is not None:
+            fa_kwargs["fa_version"] = self.fa_version
+        out_prefix, lse_prefix = flash_attn_varlen_func(**fa_kwargs)
+        # out_prefix: (B, Hq, D); lse_prefix: (Hq, B) per FA's convention —
+        # transpose to (B, Hq) to match our quantized-side LSE shape.
+        if lse_prefix.dim() == 2 and lse_prefix.shape != (B, Hq):
+            lse_prefix = lse_prefix.transpose(0, 1).contiguous()
+
+        # ── Fast exit: when no quantized decode region exists (just-after-prefill)
+        seq_lens = attn_metadata.seq_lens
+        # Single-sequence assumption mirrors the do_kv_cache_update path.
+        max_seq = int(seq_lens.max().item())
+        if max_seq <= prefix_len:
+            return out_prefix.to(query.dtype)
+
+        # ── Phase 2: quantized decode kernel on positions [prefix_len, seq_len) ─
+        q_rot = self.rotation.rotate_for_decode(query.float(), layer)
+        BLOCK_D = triton.next_power_of_2(D)
+        NUM_KV_SPLITS = self.max_num_kv_splits
+
+        mid_o = self._get_or_alloc_buf(
+            layer, "_fused_mid_o", (B, Hq, NUM_KV_SPLITS, D + 1),
+            dtype=torch.float32, device=device,
+        )
+        output = self._get_or_alloc_buf(
+            layer, "_fused_output", (B, Hq, D),
+            dtype=torch.float32, device=device,
+        )
+        lse = self._get_or_alloc_buf(
+            layer, "_fused_lse", (B, Hq), dtype=torch.float32, device=device
+        )
+
+        kv_start_offset = torch.full(
+            (B,), prefix_len, dtype=seq_lens.dtype, device=device
+        )
+
+        fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
+        BLOCK_KV = 4
+        grid1 = (B, Hq, NUM_KV_SPLITS)
+        _tq_decode_stage1_offset[grid1](
+            q_rot,
+            kv_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            kv_start_offset,
+            self.rotation.get_centroids(layer),
+            mid_o,
+            q_rot.stride(0),
+            q_rot.stride(1),
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_cache.stride(2),
+            attn_metadata.block_table.stride(0),
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            NUM_KV_HEADS=Hk,
+            HEAD_DIM=D,
+            BLOCK_SIZE=block_size,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            KV_GROUP_SIZE=kv_group_size,
+            MSE_BITS=self.tq_config.key_mse_bits,
+            MSE_BYTES=self._mse_bytes,
+            KPS=self.tq_config.key_packed_size,
+            VQB=self.tq_config.effective_value_quant_bits,
+            VAL_DATA_BYTES=self._val_data_bytes,
+            ATTN_SCALE=self.scale,
+            BLOCK_D=BLOCK_D,
+            BLOCK_KV=BLOCK_KV,
+            KEY_FP8=0,
+            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+            FP8_E4B15=fp8_e4b15,
+            num_warps=1,
+            num_stages=1,
+        )
+
+        grid2 = (B, Hq)
+        # Pass an "effective seq_lens" = (seq_lens - prefix_len) to stage2
+        # so its empty-split bookkeeping matches what stage1 actually
+        # processed.
+        eff_seq_lens = (seq_lens - prefix_len).clamp(min=0)
+        _fwd_kernel_stage2[grid2](
+            mid_o,
+            output,
+            lse,
+            eff_seq_lens,
+            mid_o.stride(0),
+            mid_o.stride(1),
+            mid_o.stride(2),
+            output.stride(0),
+            output.stride(1),
+            lse.stride(0),
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            BLOCK_DV=BLOCK_D,
+            Lv=D,
+            num_warps=4,
+            num_stages=2,
+        )
+
+        # ── LSE merge ──────────────────────────────────────────────────
+        out_prefix_f = out_prefix.to(torch.float32)
+        lse_prefix_f = lse_prefix.to(torch.float32)
+        lse_max = torch.maximum(lse_prefix_f, lse)
+        exp_p = torch.exp(lse_prefix_f - lse_max)
+        exp_q = torch.exp(lse - lse_max)
+        total = exp_p + exp_q
+        w_p = (exp_p / total).unsqueeze(-1)
+        w_q = (exp_q / total).unsqueeze(-1)
+        out_combined = out_prefix_f * w_p + output * w_q
+        return out_combined.to(query.dtype)
 
     # ------------------------------------------------------------------
     # Prefill: flash-attn fast path or per-sequence loop
