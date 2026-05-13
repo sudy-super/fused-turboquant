@@ -89,6 +89,16 @@ def _bucketize_pack_norm_v_store(
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3, b0, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 1, b1, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
+    elif MSE_BITS == 2:
+        # 4 two-bit indices per byte. BLOCK_D / 4 must be a positive power
+        # of 2 — guaranteed since BLOCK_D = next_pow2(head_dim) and 4 | BLOCK_D
+        # for the head_sizes we support (head_dim >= 64).
+        idx_quads = tl.reshape(idx_q, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed = tl.sum((idx_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        mse_offs = tl.arange(0, BLOCK_D // 4)
+        mse_mask = mse_offs < MSE_BYTES
+        tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
 
     # ── 3. STORE NORM (fp16, 2 bytes) ──────────────────────────────
     norm_offset = MSE_BYTES
@@ -120,6 +130,32 @@ def _bucketize_pack_norm_v_store(
         tl.store(KV_cache_ptr + slot_base + val_cache_offset + grp_offs * 3, b0, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + val_cache_offset + grp_offs * 3 + 1, b1, mask=grp_mask)
         tl.store(KV_cache_ptr + slot_base + val_cache_offset + grp_offs * 3 + 2, b2, mask=grp_mask)
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_f16 = v_scale.to(tl.float16)
+        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 1, ((sc_u16 >> 8) & 0xFF).to(tl.uint8))
+        zr_f16 = val_min.to(tl.float16)
+        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 3, ((zr_u16 >> 8) & 0xFF).to(tl.uint8))
+    elif VQB == 2:
+        # 2-bit uniform: 4 levels, packed 4 entries per byte.
+        v_scale = (val_max - val_min) / 3.0
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 3
+        )
+        q_quads = tl.reshape(q_all, [BLOCK_D // 4, 4])
+        shifts_2 = tl.arange(0, 4) * 2
+        packed_val = tl.sum((q_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 4)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+            packed_val,
+            mask=val_mask,
+        )
         sc_offset = val_cache_offset + VAL_DATA_BYTES
         sc_f16 = v_scale.to(tl.float16)
         sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
