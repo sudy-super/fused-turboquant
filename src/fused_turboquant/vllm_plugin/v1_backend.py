@@ -333,6 +333,11 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_")
         )
         if self._is_raw:
+            # We still need fa_version for the vectorized _forward_raw
+            # path that calls flash_attn_varlen_func with a paged
+            # block_table.
+            from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
+            self.fa_version = get_flash_attn_version(head_size=head_size)
             logger.info(
                 "FusedTurboQuantV1Impl init: raw fp16 fallback (kv_cache_dtype=%s, "
                 "boundary-protection layer). head_size=%d num_heads=%d "
@@ -1077,10 +1082,11 @@ class FusedTurboQuantV1Impl(AttentionImpl):
     ) -> None:
         """Write fp16 K and V into a byte-indexed slot.
 
-        kv_cache may arrive with dtype=uint8 (when the spec we patched
-        sets dtype=uint8) or with the spec's native dtype (bf16/fp16
-        for FullAttentionSpec). We normalize to a uint8 byte-view at
-        the top so the byte offsets below are dtype-independent.
+        Vectorized GPU-side scatter (no `.tolist()` Python loop) so this
+        path is safe under CUDA-graph capture. Negative slots are mapped
+        to slot 0 (and the corresponding write is harmless overwrite
+        since the attention path uses `seq_lens` to bound reads, not the
+        contents of padding slots).
 
         Slot byte layout:
             [0 .. 2*head_size)            K (fp16 bytes)
@@ -1093,21 +1099,18 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         kv_cache_u8 = (
             kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
         )
-        block_size = kv_cache_u8.shape[1]
         head_size = self.head_size
         k_bytes = v_bytes = 2 * head_size
         k_fp16 = key.to(torch.float16).contiguous()
         v_fp16 = value.to(torch.float16).contiguous()
         k_u8 = k_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, k_bytes)
         v_u8 = v_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, v_bytes)
-        slot_cpu = slot_mapping.tolist()
-        for i, slot in enumerate(slot_cpu):
-            if slot < 0:
-                continue
-            block_idx = slot // block_size
-            offset = slot % block_size
-            kv_cache_u8[block_idx, offset, :, :k_bytes] = k_u8[i]
-            kv_cache_u8[block_idx, offset, :, k_bytes : k_bytes + v_bytes] = v_u8[i]
+        # Flatten (block, pos) → linear slot index. `slot_mapping` already
+        # uses this linear convention.
+        flat = kv_cache_u8.view(-1, self.num_kv_heads, kv_cache_u8.shape[-1])
+        safe_slots = slot_mapping.clamp(min=0)
+        flat[safe_slots, :, :k_bytes] = k_u8
+        flat[safe_slots, :, k_bytes : k_bytes + v_bytes] = v_u8
 
     def _gather_raw_kv(
         self,
@@ -1159,7 +1162,87 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         output: torch.Tensor,
         N: int,
     ) -> torch.Tensor:
-        """Plain SDPA per-sequence over raw fp16 K/V (no quantization)."""
+        """Vectorized plain-FP16 attention for boundary-protection layers.
+
+        Uses flash_attn_varlen_func with the paged block_table directly
+        — no Python `.tolist()` loops, no per-sequence dispatching — so
+        this path is CUDA-graph capturable. The trick: our slot byte
+        layout for boundary slots is exactly `[K_fp16 | V_fp16]` (4 * D
+        bytes, already a power of 2 for D ∈ {64, 128, 256, 512}), so we
+        can `.view(torch.float16)` the cache and slice off K, V as the
+        flash-attn paged-cache tensors.
+        """
+        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+        q = query[:N].view(N, self.num_heads, self.head_size)
+
+        # View the byte-layout slots as FP16 [K | V]. Requires the slot
+        # to be exactly 2*head_size FP16 elements (no padding). This
+        # holds for D ∈ {64, 128, 256, 512} (4*D is a power of 2, so
+        # `_slot_size_for` doesn't round up further when BP is on).
+        head_size = self.head_size
+        kv_u8 = (
+            kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
+        )
+        slot_bytes = kv_u8.shape[-1]
+        expected_bytes = 4 * head_size  # K_fp16 + V_fp16
+        if slot_bytes != expected_bytes:
+            # Padded slot — fall back to the per-sequence Python loop.
+            return self._forward_raw_python_loop(
+                query, key, value, kv_cache, attn_metadata, output, N
+            )
+
+        kv_fp16 = kv_u8.view(torch.float16).view(
+            kv_u8.shape[0], kv_u8.shape[1], kv_u8.shape[2], 2 * head_size,
+        )
+        # NB: slicing the last dim yields tensors whose stride along the
+        # H axis is 2*head_size rather than head_size — flash-attn-v2
+        # accepts that via its non-default-stride code path.
+        k_cache = kv_fp16[..., :head_size]
+        v_cache = kv_fp16[..., head_size:]
+
+        causal = self.attn_type not in (
+            AttentionType.ENCODER, AttentionType.ENCODER_ONLY
+        )
+
+        # Use flash_attn_varlen_func with paged block_table. The cache
+        # already has the current K, V written via `_store_raw_kv`, so
+        # `seqused_k = seq_lens` and we don't need to pass k_new / v_new.
+        kwargs = dict(
+            q=q.to(torch.float16),
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=attn_metadata.query_start_loc.to(torch.int32),
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens.to(torch.int32),
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=causal,
+            block_table=attn_metadata.block_table.to(torch.int32),
+        )
+        if self.fa_version is not None:
+            kwargs["fa_version"] = self.fa_version
+        attn_out = flash_attn_varlen_func(**kwargs)  # [N, num_heads, head_size]
+
+        if output.ndim == 3:
+            output[:N] = attn_out.to(output.dtype)
+        else:
+            output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+        return output
+
+    def _forward_raw_python_loop(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+        N: int,
+    ) -> torch.Tensor:
+        """Original per-sequence implementation. Kept for the padded-slot
+        case (where the FP16 view trick doesn't apply); not CUDA-graph
+        capturable due to `.tolist()` calls."""
         q = query[:N].view(N, self.num_heads, self.head_size)
         attn_out = torch.empty(
             N, self.num_heads, self.head_size, dtype=q.dtype, device=q.device
@@ -1183,7 +1266,6 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             if self.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
                 sub = self._sdpa_local(q_i, k_i, v_i, is_causal=False)
             elif q_len > 1 and context_len == 0:
-                # First-chunk prefill
                 sub = self._sdpa_local(q_i, k_i, v_i, is_causal=True)
             elif q_len > 1 and context_len > 0:
                 raise NotImplementedError(
@@ -1191,7 +1273,6 @@ class FusedTurboQuantV1Impl(AttentionImpl):
                     "q_len>1) is not supported."
                 )
             else:
-                # Decode step
                 cached_k, cached_v = self._gather_raw_kv(
                     kv_cache, block_table[i], seq_len
                 )
