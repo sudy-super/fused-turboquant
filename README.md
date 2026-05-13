@@ -14,6 +14,42 @@
 - 🤗 Drop-in **HuggingFace** integration and **vLLM** attention backend
 - 🔄 Auto-detects CUDA + Triton; falls back to unfused PyTorch on CPU
 
+## 🎛️ vLLM Performance Modes — at a Glance
+
+Three orthogonal switches in the vLLM backend let you trade speed against compression and prefix length. Pick the row that matches your workload.
+
+| Mode | env / flag | Effect | Best for |
+|---|---|---|---|
+| **CUDA graphs** | `enforce_eager=False` *(vLLM)* | Amortizes the per-decode-step kernel-launch overhead — **5×–14× decode tok/s** for small models, ~1.7× for 30B+ | **Always on** in production |
+| **Boundary protection** | `TURBOQUANT_BOUNDARY_PROTECT=1` | Keeps the first/last 2 layers in FP16 (paged flash-attn over the byte-view of the slot). Both higher accuracy *and*, paradoxically, often higher throughput than BP=0 because the FP16 layers attend faster than the centroid-lookup path. **Required** for `defer_prefill` to be CUDA-graph-correct. | **Always on** unless you need every last byte of compression |
+| **Deferred FP16 K-cache** | `TURBOQUANT_DEFER_PREFILL=1` | Skips rotation/quantization on prefill tokens, stores them FP16 in a side buffer, then a 2-phase attention at decode time (flash-attn on the FP16 prefix + offset-decode kernel on the quantized region, merged via log-sum-exp). | **Long context (≥ 4–5K prefix)** only — *slower* below that, see speed table |
+| **Rotation kind** | `TURBOQUANT_KIND=rht\|planar\|rotor\|iso_fast\|iso_full` | Picks the orthogonal mixer applied before MSE quantization. RHT (Walsh-Hadamard butterfly) ships in production; Planar / Rotor / Iso are block-diagonal variants (2×2 / 3×3 / 4×4) with their own fused in-kernel rotation. | RHT for max accuracy, Planar/Iso for the rotorquant-paper variants |
+
+### Recommended setup per workload
+
+| Workload | `enforce_eager` | `TURBOQUANT_BOUNDARY_PROTECT` | `TURBOQUANT_DEFER_PREFILL` |
+|---|---|---|---|
+| Short chat (≤ 4K prefix) — **default** | `False` | `1` | `0` |
+| Long-context RAG / agent (≥ 5K prefix) | `False` | `1` | `1` |
+| Max compression / accept slow decode | `False` | `0` | `0` |
+
+### Measured decode speedups (Qwen 2.5-3B-Instruct, RTX PRO 6000)
+
+Per-step decode throughput across the same model with each switch toggled. Bold = recommended default.
+
+| Prefix | Eager + BP=0 | + CUDA graphs | + BP=1 | + defer (BP=1) |
+|---:|---:|---:|---:|---:|
+| 181 tok | 35.5 | 194.7 | **193.2** | 157.7 |
+| 1,201 tok | 22.5 | 181.8 | **181.8** | 157.1 |
+| 4,801 tok | 10.4 | 147.4 | 150.2 | **155.3** |
+| 19,201 tok | 38.6 | 88.7 | 93.8 | **155.6** |
+
+Notes:
+- For comparison: [rotorquant](https://github.com/scrya-com/rotorquant) reports 119 tok/s on llama.cpp for Qwen 2.5-3B planar3 — we hit 193 tok/s on the equivalent setup, and 155 tok/s even at a 19K-token prefix.
+- `TURBOQUANT_DEFER_PREFILL=1` requires `TURBOQUANT_BOUNDARY_PROTECT=1` for CUDA-graph capture to produce correct output (BP=0 + defer + cudagraph silently corrupts output — the dispatch is mismatched at capture).
+- The deferred FP16 prefix path uses memory: a `[max_model_len, num_kv_heads, head_size]` FP16 buffer per layer, in addition to the quantized paged cache.
+- For models with `head_size > 256` (e.g. Gemma 4 31B global layers), the boundary-protection path falls back from flash-attn to a CUDA-graph-safe SDPA gather; CUDA graphs still work but the per-step overhead is higher (~1.7× over eager, not 5×+).
+
 ## 📦 Installation
 
 ```bash
