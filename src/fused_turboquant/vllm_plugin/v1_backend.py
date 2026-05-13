@@ -325,13 +325,27 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             os.environ.get("TURBOQUANT_DEFER_PREFILL", "0") == "1"
         )
 
-        # `_is_raw` mode handles boundary-protection skip layers
-        # (`kv_cache_dtype="auto"` or fp16/bf16). Raw layers don't need a
-        # rotation strategy or any of the TQ state — they store K/V as
-        # fp16 bytes in the byte-indexed slot and SDPA on retrieval.
-        self._is_raw = not (
+        # Boundary-protection-skip layers arrive here with kv_cache_dtype
+        # == "auto" / "float16" / "bfloat16". Historically those went
+        # through the raw FP16 SDPA / flash-attn path (`_is_raw=True`).
+        # Now `TURBOQUANT_BOUNDARY_PROTECT` can also be a bit count
+        # (2/3/4/8): in that case we still use the FP16-sized slot
+        # vLLM allocated for the boundary layer, but we route through
+        # the TQ pipeline at the requested bit width, leaving the
+        # unused slot bytes inert.
+        from fused_turboquant.vllm_plugin.plugin import _boundary_protect_mode
+        bp_mode = _boundary_protect_mode()
+        is_boundary_layer = not (
             isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_")
         )
+        self._is_raw = is_boundary_layer and not isinstance(bp_mode, int)
+        # When the boundary mode is a bit count, advance into the TQ
+        # setup path below — but synthesize a TurboQuantConfig at the
+        # override bits (and re-derive the spec from there). Track this
+        # so downstream code knows we're a boundary TQ layer sitting in
+        # an oversized FP16 slot.
+        self._boundary_tq_bits = bp_mode if is_boundary_layer and isinstance(bp_mode, int) else None
+
         if self._is_raw:
             # We still need fa_version for the vectorized _forward_raw
             # path that calls flash_attn_varlen_func with a paged
@@ -357,7 +371,18 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             TurboQuantConfig,
         )
 
-        self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
+        if self._boundary_tq_bits is not None:
+            # Boundary layer with quantized override. We sit in a
+            # FP16-sized slot but speak TQ at the override bit width.
+            bits = self._boundary_tq_bits
+            self.tq_config = TurboQuantConfig(
+                head_dim=head_size,
+                key_quant_bits=bits,
+                value_quant_bits=bits,
+                norm_correction=True,
+            )
+        else:
+            self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
         if self.tq_config.key_fp8:
             raise NotImplementedError(
                 "FP8 keys (turboquant_k8v4) are not yet supported by this "
@@ -467,13 +492,22 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         """Ask the rotation strategy to materialize its state on the
         layer the first time we see it. `layer._tq_centroids` is the
         Lloyd-Max level table that vLLM's `Attention._init_turboquant_buffers`
-        already attached — but vLLM computes it for the preset's
-        `key_mse_bits`, not our possibly-overridden bits. If the override
-        changes the K bit-width (and thus the centroid count), regenerate
-        the table here before the rotation strategy caches midpoints.
+        already attached — but:
+          - boundary-protect TQ override layers were configured as
+            non-TQ in vLLM (cache_dtype="auto") so vLLM may not have
+            attached centroids at all; and
+          - the per-K env-var override changes `key_mse_bits` away from
+            the preset, so the centroid table vLLM produced doesn't have
+            the right number of levels.
+        Regenerate the table here whenever it's missing or wrong-sized.
         """
         expected_n = 2 ** self.tq_config.key_mse_bits
-        if layer._tq_centroids.shape[0] != expected_n:
+        needs_regen = (
+            not hasattr(layer, "_tq_centroids")
+            or layer._tq_centroids is None
+            or layer._tq_centroids.shape[0] != expected_n
+        )
+        if needs_regen:
             from vllm.model_executor.layers.quantization.turboquant.centroids import (
                 get_centroids,
             )
@@ -515,6 +549,11 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             self._store_raw_kv(k, v, kv_cache, slot_mapping)
             return
         self._ensure_setup(layer, key.device)
+        # Boundary-layer slot was allocated as bf16/fp16. The TQ store
+        # kernels do byte-level addressing, so reinterpret as uint8 here.
+        # No-op when kv_cache is already uint8 (regular TQ layer).
+        if kv_cache.dtype != torch.uint8:
+            kv_cache = kv_cache.view(torch.uint8)
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
 
@@ -612,6 +651,13 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         if N <= 0:
             return output.fill_(0)
 
+        # Boundary-layer slot was allocated as bf16/fp16. TQ kernels do
+        # byte-level addressing, so reinterpret as uint8 once at the
+        # entry. _forward_raw / _store_raw_kv each idempotently
+        # re-view, so this is safe.
+        if kv_cache.dtype != torch.uint8:
+            kv_cache = kv_cache.view(torch.uint8)
+
         # Raw fp16 fallback for boundary-protection layers — bypasses
         # rotation strategy and stock TQ kernels entirely.
         if self._is_raw:
@@ -685,12 +731,12 @@ class FusedTurboQuantV1Impl(AttentionImpl):
                 query, kv_cache, attn_metadata, layer
             )
 
-        # 2-bit K or V: vLLM's stock `_tq_decode_stage1` doesn't ship 2-bit
-        # K/V unpacking branches. Route through our forked offset kernel
-        # (which we extended), with kv_start_offset=0 so it iterates the
-        # full sequence — same semantics as stock stage1 for non-defer.
-        if (self.tq_config.key_mse_bits == 2
-                or self.tq_config.effective_value_quant_bits == 2):
+        # Bit widths outside vLLM's stock 3/4-bit support (2-bit and 8-bit)
+        # go through our forked offset kernel where those branches live,
+        # with kv_start_offset=0 so semantics match stock stage1.
+        _kbits = self.tq_config.key_mse_bits
+        _vbits = self.tq_config.effective_value_quant_bits
+        if _kbits not in (3, 4) or _vbits not in (3, 4):
             return self._decode_attention_offset_only(
                 query, kv_cache, attn_metadata, layer
             )

@@ -57,31 +57,59 @@ def register_backend() -> None:
     _patch_disable_boundary_protection()
 
 
-def _boundary_protect_enabled() -> bool:
-    """Read `TURBOQUANT_BOUNDARY_PROTECT` env var. Default: enabled (ON).
+def _boundary_protect_mode() -> "str | int":
+    """Parse `TURBOQUANT_BOUNDARY_PROTECT` env var.
 
-    ON  (default, or any value other than 0/false/off/no): vLLM auto-adds
-        the first/last 2 attention layers to `kv_cache_dtype_skip_layers`,
-        forcing them to use `kv_cache_dtype="auto"` (raw fp16). Our
-        backend falls those through to a plain SDPA path. Slower per-step
-        but recovers Planar / Rotor accuracy — those rotations collapse
-        to 0% on GSM-8K without it. RHT keeps 100% either way.
+    Returns:
+      - `"off"`: no boundary protection — every layer goes through the
+        configured TQ preset / `turboquant_*` cache dtype and the fast
+        Triton path.
+      - `"fp16"`: vLLM auto-adds the first/last 2 attention layers to
+        `kv_cache_dtype_skip_layers` and forces them to
+        `kv_cache_dtype="auto"` (raw fp16). The backend dispatches those
+        to a paged flash-attn / SDPA path over raw fp16 K, V. This is
+        the historical default.
+      - An `int` in `{2, 3, 4, 8}`: same skip-layer mechanism as the
+        fp16 mode (boundary slot is still FP16-sized at the spec level),
+        but the boundary backend stores K / V as Lloyd-Max MSE keys and
+        uniform-quantized values at the requested bit width instead of
+        raw fp16. The fp16-sized slot has plenty of room — for d=128 we
+        need at most 2·d + 6 = 262 bytes vs the 512-byte fp16 slot, so
+        the extra capacity is just unused.
 
-    OFF (`TURBOQUANT_BOUNDARY_PROTECT=0`): the plugin overrides
-        `TurboQuantConfig.get_boundary_skip_layers` to return `[]`, so
-        every layer uses the configured `turboquant_*` cache dtype and
-        goes through our fast Triton path. Faster, but Planar / Rotor
-        collapse on Gemma 4 / GSM-8K.
+    Accepted strings (case-insensitive):
+      `0` / `off` / `false` / `no`            → `"off"`
+      `1` / `fp16` / `f16` / `bf16`           → `"fp16"`
+      `2` / `3` / `4` / `8`                   → that int
 
-    For production RHT, OFF is fine and faster. For Planar / Rotor,
-    keep ON (the default). The boundary protection itself was
-    introduced by vLLM upstream for accuracy parity with native
-    TurboQuant — disabling it is a fused-turboquant-specific opt-out.
+    Backward-compat with the older boolean-style env var: `0` still
+    means off, `1` still means fp16.
     """
     import os
 
-    val = os.environ.get("TURBOQUANT_BOUNDARY_PROTECT", "1")
-    return val.lower() not in ("0", "false", "off", "no")
+    raw = os.environ.get("TURBOQUANT_BOUNDARY_PROTECT", "1").strip().lower()
+    if raw in ("0", "false", "off", "no"):
+        return "off"
+    if raw in ("1", "fp16", "f16", "bf16", "bfloat16"):
+        return "fp16"
+    try:
+        bits = int(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"TURBOQUANT_BOUNDARY_PROTECT={raw!r} not understood. Use 0/off, "
+            f"1/fp16, or a bit count from {{2, 3, 4, 8}}."
+        ) from e
+    if bits not in (2, 3, 4, 8):
+        raise ValueError(
+            f"TURBOQUANT_BOUNDARY_PROTECT={bits} not supported. Use one of "
+            f"{{2, 3, 4, 8}} for a quantized boundary, or 1/fp16 for raw."
+        )
+    return bits
+
+
+def _boundary_protect_enabled() -> bool:
+    """Backward-compat boolean view of the boundary-protect mode."""
+    return _boundary_protect_mode() != "off"
 
 
 def _patch_disable_boundary_protection() -> None:

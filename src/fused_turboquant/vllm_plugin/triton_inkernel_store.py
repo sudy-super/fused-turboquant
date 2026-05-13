@@ -99,6 +99,12 @@ def _bucketize_pack_norm_v_store(
         mse_offs = tl.arange(0, BLOCK_D // 4)
         mse_mask = mse_offs < MSE_BYTES
         tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
+    elif MSE_BITS == 8:
+        # 1 byte per index, no packing — used by boundary-protect
+        # TQ at 8-bit (256 Lloyd-Max centroids).
+        packed = idx_q.to(tl.uint8)
+        mse_mask_8 = d_offs < MSE_BYTES
+        tl.store(KV_cache_ptr + slot_base + d_offs, packed, mask=mse_mask_8)
 
     # ── 3. STORE NORM (fp16, 2 bytes) ──────────────────────────────
     norm_offset = MSE_BYTES
@@ -155,6 +161,29 @@ def _bucketize_pack_norm_v_store(
             KV_cache_ptr + slot_base + val_cache_offset + val_offs,
             packed_val,
             mask=val_mask,
+        )
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_f16 = v_scale.to(tl.float16)
+        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 1, ((sc_u16 >> 8) & 0xFF).to(tl.uint8))
+        zr_f16 = val_min.to(tl.float16)
+        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 3, ((zr_u16 >> 8) & 0xFF).to(tl.uint8))
+    elif VQB == 8:
+        # 8-bit uniform: 256 levels, 1 byte per entry, no packing.
+        v_scale = (val_max - val_min) / 255.0
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 255
+        )
+        packed_val = q_all.to(tl.uint8)
+        val_mask_8 = d_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + d_offs,
+            packed_val,
+            mask=val_mask_8,
         )
         sc_offset = val_cache_offset + VAL_DATA_BYTES
         sc_f16 = v_scale.to(tl.float16)
