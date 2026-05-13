@@ -390,6 +390,17 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        # Capacity of the FP16 prefix buffer used by the deferred-prefill
+        # decode path. Fixed at impl-init time so the tensor shape never
+        # changes across calls (required for CUDA-graph capture).
+        # Use max(max_model_len, max_num_batched_tokens) so that vLLM's
+        # multi-token dummy capture run also fits.
+        sched = getattr(vllm_config, "scheduler_config", None)
+        max_batch = getattr(sched, "max_num_batched_tokens", 0) if sched else 0
+        self._fp16_prefix_max = max(
+            vllm_config.model_config.max_model_len,
+            int(max_batch),
+        )
 
         logger.info(
             "FusedTurboQuantV1Impl init: rotation=%s preset=%s K=%dbit V=%dbit "
@@ -415,6 +426,12 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         already attached.
         """
         self.rotation.setup_layer(layer, self.head_size, layer._tq_centroids, device)
+        # Eager-allocate the deferred-prefill side buffers so vLLM's
+        # CUDA-graph capture dummy run sees the hybrid path (and not the
+        # non-hybrid one, which would later read stale paged-cache slots
+        # for positions whose K only lives in this side buffer).
+        if self.defer_prefill:
+            self._ensure_fp16_prefix_buf(layer, device)
 
     # ------------------------------------------------------------------
     # Store: rotate K via strategy, launch stock fused store kernel
@@ -442,19 +459,44 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         k = key[:N].view(N, self.num_kv_heads, self.head_size)
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
 
-        if self.defer_prefill and N > 1:
+        if self.defer_prefill and N > 1 and N <= self._fp16_prefix_max:
             # Deferred FP16 K-cache: skip the rotation+quantize store kernel
             # entirely; just stash a FP16 copy on the layer for the decode
             # path to do fast SDPA against. NOTE: single-sequence assumption —
             # we overwrite the buffer per prefill, so batch > 1 prefills will
-            # clobber each other. Sufficient for benchmarking; production use
-            # needs per-sequence indexing.
-            layer._fp16_prefix_k = k.to(torch.float16).contiguous()
-            layer._fp16_prefix_v = v.to(torch.float16).contiguous()
-            layer._fp16_prefix_len = N
+            # clobber each other. Skip when N exceeds the fixed buffer
+            # capacity (e.g. vLLM's multi-token dummy capture batch).
+            self._ensure_fp16_prefix_buf(layer, key.device)
+            layer._fp16_prefix_k[:N].copy_(k.to(torch.float16))
+            layer._fp16_prefix_v[:N].copy_(v.to(torch.float16))
+            layer._fp16_prefix_len_t.fill_(N)
             return
 
         self._launch_store(k, v, kv_cache, slot_mapping, layer)
+
+    def _ensure_fp16_prefix_buf(self, layer, device) -> None:
+        """Lazily allocate FP16 prefix buffers at fixed max capacity.
+        Tensor shapes never change after this, which is required for
+        CUDA-graph capture (the decode path holds onto these tensors).
+
+        Seed `_fp16_prefix_len_t = 1` (not 0) so vLLM's CUDA-graph dummy
+        run sees a non-degenerate flash_attn call (cu_seqlens_k=[0, 1]
+        rather than [0, 0]). Some flash-attn implementations have a
+        short-circuit for the empty-k case that, once captured, doesn't
+        generalize back to the non-empty case at replay time.
+        """
+        if hasattr(layer, "_fp16_prefix_k"):
+            return
+        cap = self._fp16_prefix_max
+        layer._fp16_prefix_k = torch.zeros(
+            cap, self.num_kv_heads, self.head_size,
+            dtype=torch.float16, device=device,
+        )
+        layer._fp16_prefix_v = torch.zeros_like(layer._fp16_prefix_k)
+        layer._fp16_prefix_capacity = cap
+        layer._fp16_prefix_len_t = torch.ones(
+            1, dtype=torch.int32, device=device,
+        )
 
     def _launch_store(
         self,
@@ -572,13 +614,16 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         attn_metadata,
         layer,
     ) -> torch.Tensor:
-        # Hybrid path: if there's a deferred-prefill FP16 prefix on this
-        # layer, run two-phase attention (FP16 SDPA on prefix + quantized
-        # decode kernel on the rest) and merge via log-sum-exp.
-        prefix_len = getattr(layer, "_fp16_prefix_len", 0)
-        if self.defer_prefill and prefix_len > 0:
+        # Hybrid path: when defer_prefill is on, go through the two-phase
+        # attention. NOTE: this Python-int dispatch is incompatible with
+        # vLLM's CUDA-graph capture model — the dummy capture run has no
+        # FP16 prefix, so the captured graph corresponds to the non-
+        # hybrid branch and switching at runtime corrupts output. Run
+        # with `enforce_eager=True` when measuring the deferred-prefill
+        # path.
+        if self.defer_prefill and hasattr(layer, "_fp16_prefix_len_t"):
             return self._decode_attention_hybrid(
-                query, kv_cache, attn_metadata, layer, prefix_len
+                query, kv_cache, attn_metadata, layer
             )
 
         from vllm.triton_utils import triton
@@ -683,7 +728,6 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata,
         layer,
-        prefix_len: int,
     ) -> torch.Tensor:
         """Two-phase attention with deferred FP16 prefix.
 
@@ -714,6 +758,8 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         kv_group_size = Hq // Hk
         device = query.device
 
+        self._ensure_fp16_prefix_buf(layer, device)
+
         # ── Phase 1: flash-attn SDPA over the FP16 prefix ──────────────
         # Use vLLM's flash_attn_varlen_func with return_softmax_lse=True so
         # the prefix attention runs on tensor cores (much faster than a
@@ -721,22 +767,42 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         # here — the current decode token attends to ALL prefix positions.
         from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
-        prefix_k = layer._fp16_prefix_k  # [prefix_len, Hk, D]
-        prefix_v = layer._fp16_prefix_v
-        # flash_attn_varlen_func expects (total_q, nheads, headdim).
-        # query is already in [B, Hq, D] = (total_q=B, nheads=Hq, D).
-        q_fa = query.to(prefix_k.dtype).contiguous()
-        cu_q = torch.tensor([0, B], dtype=torch.int32, device=device)
-        cu_k = torch.tensor([0, prefix_len], dtype=torch.int32, device=device)
+        prefix_k_full = layer._fp16_prefix_k  # [capacity, Hk, D]
+        prefix_v_full = layer._fp16_prefix_v
+        prefix_capacity = layer._fp16_prefix_capacity
+        prefix_len_t = layer._fp16_prefix_len_t  # GPU int32 [1]
 
+        # flash_attn_varlen_func expects (total_q, nheads, headdim).
+        q_fa = query.to(prefix_k_full.dtype).contiguous()
+
+        # cu_seqlens must come from GPU tensors only (no Python-int writes)
+        # so this path is safe inside a captured CUDA graph. cu_q for our
+        # 1-token-per-seq decode is simply `arange(B+1) = [0, 1, ..., B]`,
+        # which we pre-allocate once at a max size and slice per call.
+        # cu_k = [0, prefix_len_t[0]] is constructed via a GPU→GPU copy.
+        MAX_B = 64
+        if not hasattr(self, "_cu_q_arange"):
+            self._cu_q_arange = torch.arange(
+                MAX_B + 1, dtype=torch.int32, device=device,
+            )
+        cu_q = self._cu_q_arange[: B + 1]
+        cu_k = self._get_or_alloc_buf(
+            self, "_cu_k_buf", (B + 1,), dtype=torch.int32, device=device,
+        )
+        cu_k.zero_()
+        cu_k[1:].copy_(prefix_len_t.expand(B))
+
+        # max_seqlen_k is required to be a Python int (used for tile-count
+        # scheduling). We pass the buffer capacity as a safe upper bound;
+        # actual work is still bounded by cu_seqlens_k.
         fa_kwargs = dict(
             q=q_fa,
-            k=prefix_k,
-            v=prefix_v,
+            k=prefix_k_full,
+            v=prefix_v_full,
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
             max_seqlen_q=B,
-            max_seqlen_k=prefix_len,
+            max_seqlen_k=prefix_capacity,
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,
@@ -749,12 +815,11 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         if lse_prefix.dim() == 2 and lse_prefix.shape != (B, Hq):
             lse_prefix = lse_prefix.transpose(0, 1).contiguous()
 
-        # ── Fast exit: when no quantized decode region exists (just-after-prefill)
+        # No CPU-side early exit (would break CUDA-graph capture). We
+        # always run phase 2 too; if eff_seq_lens turns out to be 0 the
+        # offset kernel produces lse=-inf for every split and the merge
+        # below drops phase 2 to zero weight.
         seq_lens = attn_metadata.seq_lens
-        # Single-sequence assumption mirrors the do_kv_cache_update path.
-        max_seq = int(seq_lens.max().item())
-        if max_seq <= prefix_len:
-            return out_prefix.to(query.dtype)
 
         # ── Phase 2: quantized decode kernel on positions [prefix_len, seq_len) ─
         q_rot = self.rotation.rotate_for_decode(query.float(), layer)
@@ -773,9 +838,12 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             layer, "_fused_lse", (B, Hq), dtype=torch.float32, device=device
         )
 
-        kv_start_offset = torch.full(
-            (B,), prefix_len, dtype=seq_lens.dtype, device=device
+        # GPU-only construction: pre-alloc + GPU→GPU copy from prefix_len_t.
+        kv_start_offset = self._get_or_alloc_buf(
+            self, "_kv_start_offset_buf", (B,),
+            dtype=seq_lens.dtype, device=device,
         )
+        kv_start_offset.copy_(prefix_len_t.to(seq_lens.dtype).expand(B))
 
         fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
         BLOCK_KV = 4
@@ -821,7 +889,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         # Pass an "effective seq_lens" = (seq_lens - prefix_len) to stage2
         # so its empty-split bookkeeping matches what stage1 actually
         # processed.
-        eff_seq_lens = (seq_lens - prefix_len).clamp(min=0)
+        eff_seq_lens = (seq_lens - prefix_len_t.to(seq_lens.dtype)).clamp(min=0)
         _fwd_kernel_stage2[grid2](
             mid_o,
             output,
@@ -840,13 +908,21 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             num_stages=2,
         )
 
+        # Stage2 produces NaN for splits where eff_seq_lens==0 (division
+        # by zero in `acc / e_sum`). Replace with safe sentinels before
+        # the merge so an empty phase 2 reduces to "use phase 1 only".
+        # Use `torch.full` (kernel-arg scalar, no CPU→GPU copy) to stay
+        # CUDA-graph-safe.
+        lse = lse.nan_to_num(nan=-float("inf"))
+        output = output.nan_to_num(nan=0.0)
+
         # ── LSE merge ──────────────────────────────────────────────────
         out_prefix_f = out_prefix.to(torch.float32)
         lse_prefix_f = lse_prefix.to(torch.float32)
         lse_max = torch.maximum(lse_prefix_f, lse)
         exp_p = torch.exp(lse_prefix_f - lse_max)
         exp_q = torch.exp(lse - lse_max)
-        total = exp_p + exp_q
+        total = (exp_p + exp_q).clamp(min=1e-20)
         w_p = (exp_p / total).unsqueeze(-1)
         w_q = (exp_q / total).unsqueeze(-1)
         out_combined = out_prefix_f * w_p + output * w_q
