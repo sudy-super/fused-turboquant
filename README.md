@@ -136,6 +136,36 @@ vLLM バックエンドには 3 つの独立した切り替えスイッチがあ
 | 4,801 | 10.4 | 147.4 | 150.2 | **155.3** |
 | 19,201 | 38.6 | 88.7 | 93.8 | **155.6** |
 
+### カーネル単体の速度 (RHT vs 各ブロック対角型, RTX PRO 6000)
+
+fused store カーネル単体 (rotation + bucketize + V quant + slot scatter まで含む 1 launch) を計測したものです。`matrix(D,D)` は最初に実装した汎用 `(D,D)` 行列を SRAM タイルでまるごと matmul する経路で、ブロック対角型の理論優位性を計測する比較基準として残しています (実運用では block-diag 戦略がデフォルト)。1024 トークン × KV 8 ヘッド × バッチ 1。
+
+| 設定 | RHT (FWHT butterfly) [µs] | matrix(D,D) [µs] | planar (B=2) [µs] | rotor (B=3) [µs] | iso_fast (B=4) [µs] | iso_full (B=4) [µs] |
+|---|---:|---:|---:|---:|---:|---:|
+| **prefill 1024 tok, D=128** | 100.3 | 114.4 | **100.2** | **99.9** | **99.5** | 100.3 |
+| **prefill 1024 tok, D=256** | 106.6 | **3,088.3** | **100.0** | **100.4** | **100.2** | **99.8** |
+| **decode 1 tok, D=128** | 100.7 | 88.9 | 100.4 | 100.1 | 100.4 | 100.7 |
+| **decode 1 tok, D=256** | 99.6 | 92.6 | 101.8 | 101.0 | 100.8 | 100.1 |
+
+ポイント:
+- **D=256 prefill**: 汎用 `(D,D)` matmul カーネルは 65 KB の float32 タイルが SRAM に乗らずタイル化が走るため **約 30 倍遅く** なる。これに対し block-diag (Planar / Rotor / Iso) はブロックあたり 4〜16 FMA で済むため約 100 µs に揃う。これが [rotorquant の論文](https://www.scrya.com/rotorquant/)が主張する「TurboQuant 比 10〜19 倍速い」の正体で、本実装でも同等の効果が得られています。
+- **D=128 prefill**: `(D,D)` matmul も SRAM に乗るので差は小さい (約 14%)。RHT / block-diag / matrix のいずれもほぼ同じ。
+- **decode 1 token**: 8 ヘッド × 1 トークンとワークが小さく、すべてのカーネルが約 100 µs で頭打ち = **CUDA launch overhead 律速**。実プログラムを 1 launch 単位で見ると差はほぼ noise レベルなので、end-to-end の decode スループットには直接効きません。
+- block-diag 戦略間 (Planar / Rotor / Iso_Fast / Iso_Full) は B=2〜4 で FMA 数こそ違うものの、measure 上は全て約 100 µs に揃う (B が小さいほど僅かに速いがやはり launch 律速)。**精度の差はあっても速度の差は微小**、というのが実装上の結論です。
+
+### K と V に独立な bit 数を割り当てる
+
+`kv_cache_dtype` のプリセット 4 種を切り替えるだけで K / V それぞれ独立に bit 数を選べます (任意の組み合わせではなくプリセット単位)。
+
+| `kv_cache_dtype` | K の量子化 [bit] | V の量子化 [bit] | 圧縮率 (vs FP16) | 備考 |
+|---|---:|---:|---:|---|
+| `turboquant_4bit_nc` | **4** (MSE) | **4** (uniform) | ~3.8× | 既定。本リポジトリで主にベンチに使用 |
+| `turboquant_k3v4_nc` | **3** (MSE) | **4** (uniform) | ~3.5× | K だけさらに圧縮、V は 4-bit のまま精度確保 |
+| `turboquant_3bit_nc` | **3** (MSE) | **3** (uniform) | ~4.9× | 最大圧縮 (精度低下大) |
+| `turboquant_k8v4` | **8** (FP8) | **4** (uniform) | ~2.6× | FP8 keys — v1 backend では未対応、stock vLLM 経路のみ |
+
+> 補足: v1 backend (`attention_backend="TURBOQUANT"`) では FP8 keys (`turboquant_k8v4`) はまだサポートしていません。`4bit_nc` / `k3v4_nc` / `3bit_nc` の 3 種から選べます。任意の (K_bit, V_bit) ペアではなく、上記のプリセット内に対応する組み合わせがある場合のみ利用可能です。
+
 補足:
 - 比較対象: [rotorquant](https://github.com/scrya-com/rotorquant) は llama.cpp 上の Qwen 2.5-3B planar3 で 119 tok/s と報告。本実装では同条件で 193 tok/s、19K トークン prefix でも 155 tok/s を維持します。
 - `TURBOQUANT_DEFER_PREFILL=1` を使うには `TURBOQUANT_BOUNDARY_PROTECT=1` が必要です。BP=0 + defer + cudagraph はクラッシュせず動きますが、capture 時のディスパッチが不一致のため出力が無音で壊れます。
