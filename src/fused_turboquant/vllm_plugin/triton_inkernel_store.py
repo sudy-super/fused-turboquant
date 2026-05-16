@@ -56,66 +56,140 @@ def _bucketize_pack_norm_v_store(
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     BLOCK_GRP: tl.constexpr,
+    KEY_FP8: tl.constexpr = 0,         # 1 = store K as raw FP8 instead of MSE indices
+    FP8_E4B15: tl.constexpr = 0,       # 1 = use e4b15 (SM<8.9), 0 = e4nv (Hopper+/Blackwell)
+    V_LLOYD_MAX: tl.constexpr = 0,     # 1 = quantize V via Lloyd-Max (unit-norm + same midpoints as K)
+                                       # 0 = existing per-vector uniform quant
 ):
-    """Identical layout to vLLM's `_tq_fused_store_mse` from this point on."""
-    # ── 1. BINARY SEARCH BUCKETIZE ───────────────────────────────────
-    lo = tl.zeros([BLOCK_D], dtype=tl.int32)
-    hi = tl.full([BLOCK_D], N_CENTROIDS - 1, dtype=tl.int32)
-    for _ in range(MSE_BITS):
-        mid = (lo + hi) >> 1
-        safe_mid = tl.minimum(mid, N_CENTROIDS - 2)
-        mid_val = tl.load(Midpoints_ptr + safe_mid, mask=d_mask, other=0.0)
-        lo = tl.where(y_vec >= mid_val, mid + 1, lo)
-        hi = tl.where(y_vec >= mid_val, hi, mid)
-    idx_q = tl.minimum(lo, N_CENTROIDS - 1)
+    """Bucketize+pack the rotated K vector and quantize V into the
+    paged-cache slot.
 
-    # ── 2. PACK MSE INDICES ─────────────────────────────────────────
-    if MSE_BITS == 4:
-        idx_pairs = tl.reshape(idx_q, [BLOCK_D // 2, 2])
-        shifts_4 = tl.arange(0, 2) * 4
-        packed = tl.sum((idx_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
-        mse_offs = tl.arange(0, BLOCK_D // 2)
-        mse_mask = mse_offs < MSE_BYTES
-        tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
-    elif MSE_BITS == 3:
-        grp_offs = tl.arange(0, BLOCK_GRP)
-        grp_mask = grp_offs < (D // 8)
-        idx_grp = tl.reshape(idx_q, [BLOCK_GRP, 8])
-        shifts_3 = tl.arange(0, 8) * 3
-        packed_24 = tl.sum((idx_grp & 0x7) << shifts_3[None, :], axis=1)
-        b0 = (packed_24 & 0xFF).to(tl.uint8)
-        b1 = ((packed_24 >> 8) & 0xFF).to(tl.uint8)
-        b2 = ((packed_24 >> 16) & 0xFF).to(tl.uint8)
-        tl.store(KV_cache_ptr + slot_base + grp_offs * 3, b0, mask=grp_mask)
-        tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 1, b1, mask=grp_mask)
-        tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
-    elif MSE_BITS == 2:
-        # 4 two-bit indices per byte. BLOCK_D / 4 must be a positive power
-        # of 2 — guaranteed since BLOCK_D = next_pow2(head_dim) and 4 | BLOCK_D
-        # for the head_sizes we support (head_dim >= 64).
-        idx_quads = tl.reshape(idx_q, [BLOCK_D // 4, 4])
-        shifts_2 = tl.arange(0, 4) * 2
-        packed = tl.sum((idx_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
-        mse_offs = tl.arange(0, BLOCK_D // 4)
-        mse_mask = mse_offs < MSE_BYTES
-        tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
-    elif MSE_BITS == 8:
-        # 1 byte per index, no packing — used by boundary-protect
-        # TQ at 8-bit (256 Lloyd-Max centroids).
-        packed = idx_q.to(tl.uint8)
-        mse_mask_8 = d_offs < MSE_BYTES
-        tl.store(KV_cache_ptr + slot_base + d_offs, packed, mask=mse_mask_8)
+    Two storage modes for keys, selected at compile time:
 
-    # ── 3. STORE NORM (fp16, 2 bytes) ──────────────────────────────
-    norm_offset = MSE_BYTES
-    vn_f16 = norm.to(tl.float16)
-    vn_u16 = vn_f16.to(tl.uint16, bitcast=True)
-    tl.store(KV_cache_ptr + slot_base + norm_offset, (vn_u16 & 0xFF).to(tl.uint8))
-    tl.store(KV_cache_ptr + slot_base + norm_offset + 1, ((vn_u16 >> 8) & 0xFF).to(tl.uint8))
+    - `KEY_FP8 == 0` (default, MSE): bucketize `y_vec` against the
+      Lloyd-Max midpoints, pack 2/3/4/8-bit indices, then store the
+      per-vector FP16 norm. Slot layout: `[indices … | norm(2B)]`.
+    - `KEY_FP8 == 1`: skip bucketize. Multiply `y_vec * norm` to undo
+      the in-kernel normalization, cast to FP8 (e4b15 / e4nv per
+      `FP8_E4B15`), store 1 byte per dim. Slot layout: `[fp8 K bytes]`,
+      no norm slot.
+
+    In both modes the value tensor is uniform-quantized and packed
+    after the key region (offset `KPS = key_packed_size`)."""
+    # ── 1. STORE KEYS ──────────────────────────────────────────────
+    if KEY_FP8:
+        # FP8 K path: undo normalization, cast, store raw bytes.
+        y_unnorm = y_vec * norm
+        if FP8_E4B15:
+            k_fp8 = y_unnorm.to(tl.float8e4b15)
+        else:
+            k_fp8 = y_unnorm.to(tl.float8e4nv)
+        k_fp8_u8 = k_fp8.to(tl.uint8, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + d_offs, k_fp8_u8, mask=d_mask)
+        # No norm storage in FP8 mode.
+    else:
+        # MSE path: binary-search the centroid table.
+        lo = tl.zeros([BLOCK_D], dtype=tl.int32)
+        hi = tl.full([BLOCK_D], N_CENTROIDS - 1, dtype=tl.int32)
+        for _ in range(MSE_BITS):
+            mid = (lo + hi) >> 1
+            safe_mid = tl.minimum(mid, N_CENTROIDS - 2)
+            mid_val = tl.load(Midpoints_ptr + safe_mid, mask=d_mask, other=0.0)
+            lo = tl.where(y_vec >= mid_val, mid + 1, lo)
+            hi = tl.where(y_vec >= mid_val, hi, mid)
+        idx_q = tl.minimum(lo, N_CENTROIDS - 1)
+
+        # ── 2. PACK MSE INDICES ─────────────────────────────────────────
+        if MSE_BITS == 4:
+            idx_pairs = tl.reshape(idx_q, [BLOCK_D // 2, 2])
+            shifts_4 = tl.arange(0, 2) * 4
+            packed = tl.sum((idx_pairs & 0xF) << shifts_4[None, :], axis=1).to(tl.uint8)
+            mse_offs = tl.arange(0, BLOCK_D // 2)
+            mse_mask = mse_offs < MSE_BYTES
+            tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
+        elif MSE_BITS == 3:
+            grp_offs = tl.arange(0, BLOCK_GRP)
+            grp_mask = grp_offs < (D // 8)
+            idx_grp = tl.reshape(idx_q, [BLOCK_GRP, 8])
+            shifts_3 = tl.arange(0, 8) * 3
+            packed_24 = tl.sum((idx_grp & 0x7) << shifts_3[None, :], axis=1)
+            b0 = (packed_24 & 0xFF).to(tl.uint8)
+            b1 = ((packed_24 >> 8) & 0xFF).to(tl.uint8)
+            b2 = ((packed_24 >> 16) & 0xFF).to(tl.uint8)
+            tl.store(KV_cache_ptr + slot_base + grp_offs * 3, b0, mask=grp_mask)
+            tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 1, b1, mask=grp_mask)
+            tl.store(KV_cache_ptr + slot_base + grp_offs * 3 + 2, b2, mask=grp_mask)
+        elif MSE_BITS == 2:
+            # 4 two-bit indices per byte. BLOCK_D / 4 must be a positive power
+            # of 2 — guaranteed since BLOCK_D = next_pow2(head_dim) and 4 | BLOCK_D
+            # for the head_sizes we support (head_dim >= 64).
+            idx_quads = tl.reshape(idx_q, [BLOCK_D // 4, 4])
+            shifts_2 = tl.arange(0, 4) * 2
+            packed = tl.sum((idx_quads & 0x3) << shifts_2[None, :], axis=1).to(tl.uint8)
+            mse_offs = tl.arange(0, BLOCK_D // 4)
+            mse_mask = mse_offs < MSE_BYTES
+            tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
+        elif MSE_BITS == 8:
+            # 1 byte per index, no packing — used by boundary-protect
+            # TQ at 8-bit (256 Lloyd-Max centroids).
+            packed = idx_q.to(tl.uint8)
+            mse_mask_8 = d_offs < MSE_BYTES
+            tl.store(KV_cache_ptr + slot_base + d_offs, packed, mask=mse_mask_8)
+
+        # ── 3. STORE NORM (fp16, 2 bytes) ──────────────────────────────
+        norm_offset = MSE_BYTES
+        vn_f16 = norm.to(tl.float16)
+        vn_u16 = vn_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + norm_offset, (vn_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + norm_offset + 1, ((vn_u16 >> 8) & 0xFF).to(tl.uint8))
 
     # ── 4. VALUE QUANTIZE + PACK ──────────────────────────────────
     val_cache_offset = KPS
     val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+
+    if V_LLOYD_MAX and VQB == 4:
+        # Lloyd-Max V path: unit-normalize, bucketize against the SAME midpoints
+        # as the keys, pack 4-bit indices, store per-vector norm where the
+        # uniform path would have stored scale. Zero-point byte is left as 0
+        # so the slot layout (and `key_packed_size` / `value_data_bytes`) is
+        # unchanged — the decode kernel reads `V_LLOYD_MAX` to interpret the
+        # stored bytes correctly.
+        v_norm_sq = tl.sum(val_vec * val_vec, axis=0)
+        v_norm = tl.sqrt(v_norm_sq + 1e-16)
+        v_unit = val_vec / (v_norm + 1e-8)
+
+        v_lo = tl.zeros([BLOCK_D], dtype=tl.int32)
+        v_hi = tl.full([BLOCK_D], N_CENTROIDS - 1, dtype=tl.int32)
+        for _ in range(MSE_BITS):
+            v_mid = (v_lo + v_hi) >> 1
+            v_safe_mid = tl.minimum(v_mid, N_CENTROIDS - 2)
+            v_mid_val = tl.load(Midpoints_ptr + v_safe_mid, mask=d_mask, other=0.0)
+            v_lo = tl.where(v_unit >= v_mid_val, v_mid + 1, v_lo)
+            v_hi = tl.where(v_unit >= v_mid_val, v_hi, v_mid)
+        v_idx = tl.minimum(v_lo, N_CENTROIDS - 1)
+
+        v_pairs = tl.reshape(v_idx, [BLOCK_D // 2, 2])
+        v_shifts = tl.arange(0, 2) * 4
+        v_packed = tl.sum((v_pairs & 0xF) << v_shifts[None, :], axis=1).to(tl.uint8)
+        v_offs = tl.arange(0, BLOCK_D // 2)
+        v_mask = v_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + v_offs,
+            v_packed,
+            mask=v_mask,
+        )
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        vn_f16 = v_norm.to(tl.float16)
+        vn_u16 = vn_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (vn_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 1, ((vn_u16 >> 8) & 0xFF).to(tl.uint8))
+        # Zero out unused 2 bytes (the uniform path's zero-point slot).
+        # Use the same fp16 0.0 trick to avoid 0-d tensor edge cases.
+        z_u16 = tl.full([], 0, tl.uint16)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (z_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 3, ((z_u16 >> 8) & 0xFF).to(tl.uint8))
+        return
+
     val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
     val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
 
@@ -276,6 +350,9 @@ def _fused_store_rht(
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
+    KEY_FP8: tl.constexpr = 0,
+    FP8_E4B15: tl.constexpr = 0,
+    V_LLOYD_MAX: tl.constexpr = 0,
 ):
     """RHT in-kernel: normalize → FWHT butterfly → fused store."""
     pid = tl.program_id(0)
@@ -323,6 +400,8 @@ def _fused_store_rht(
         D=D, BLOCK_D=BLOCK_D, MSE_BYTES=MSE_BYTES, KPS=KPS,
         VQB=VQB, VAL_DATA_BYTES=VAL_DATA_BYTES, BLOCK_VAL=BLOCK_VAL,
         MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, BLOCK_GRP=BLOCK_GRP,
+        KEY_FP8=KEY_FP8, FP8_E4B15=FP8_E4B15,
+        V_LLOYD_MAX=V_LLOYD_MAX,
     )
 
 
@@ -365,6 +444,9 @@ def _fused_store_matrix(
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
+    KEY_FP8: tl.constexpr = 0,
+    FP8_E4B15: tl.constexpr = 0,
+    V_LLOYD_MAX: tl.constexpr = 0,
 ):
     """Generic in-kernel (D,D) rotation. Used by Planar/Rotor/Iso.
 
@@ -419,10 +501,19 @@ def _fused_store_matrix(
         D=D, BLOCK_D=BLOCK_D, MSE_BYTES=MSE_BYTES, KPS=KPS,
         VQB=VQB, VAL_DATA_BYTES=VAL_DATA_BYTES, BLOCK_VAL=BLOCK_VAL,
         MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, BLOCK_GRP=BLOCK_GRP,
+        KEY_FP8=KEY_FP8, FP8_E4B15=FP8_E4B15,
+        V_LLOYD_MAX=V_LLOYD_MAX,
     )
 
 
 # ─── Launcher helpers ────────────────────────────────────────────────────────
+
+
+def _use_fp8_e4b15(device: torch.device) -> bool:
+    """Return True if FP8 e4b15 should be used (SM < 8.9, Ampere/early Ada).
+    Hopper / Blackwell prefer e4nv which has no bias adjustment."""
+    major, minor = torch.cuda.get_device_capability(device)
+    return (major, minor) < (8, 9)
 
 
 def _launch_rht(
@@ -443,11 +534,20 @@ def _launch_rht(
     if (1 << log2_d) != D:
         raise ValueError(f"RHT requires power-of-2 head_dim, got {D}")
 
-    mse_bytes = math.ceil(D * tq_config.key_mse_bits / 8)
-    n_centroids = 2 ** tq_config.key_mse_bits
+    key_fp8 = bool(getattr(tq_config, "key_fp8", False))
+    import os as _os
+    v_lloyd_max = 1 if _os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1" else 0
+    # MSE bits drops to 0 in FP8 mode (`BoundaryTurboQuantConfig.key_mse_bits`).
+    # Force MSE_BITS to a small positive value so Triton's constexpr binary
+    # search loop compiles, but the entire MSE branch is dead-code under
+    # KEY_FP8=1 — the compiler eliminates it.
+    eff_mse_bits = tq_config.key_mse_bits if not key_fp8 else 2
+    mse_bytes = math.ceil(D * eff_mse_bits / 8) if not key_fp8 else 0
+    n_centroids = 2 ** eff_mse_bits
     val_data_bytes = math.ceil(D * tq_config.effective_value_quant_bits / 8)
     BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
     BLOCK_GRP = triton.next_power_of_2(D // 8) if D >= 8 else 1
+    fp8_e4b15 = _use_fp8_e4b15(key.device) if key_fp8 else False
 
     k_flat = key.float().reshape(NH, D).contiguous()
     v_flat = value.float().reshape(NH, D).contiguous()
@@ -470,9 +570,12 @@ def _launch_rht(
         VQB=tq_config.effective_value_quant_bits,
         VAL_DATA_BYTES=val_data_bytes,
         BLOCK_VAL=BLOCK_VAL,
-        MSE_BITS=tq_config.key_mse_bits,
+        MSE_BITS=eff_mse_bits,
         N_CENTROIDS=n_centroids,
         BLOCK_GRP=BLOCK_GRP,
+        KEY_FP8=1 if key_fp8 else 0,
+        FP8_E4B15=1 if fp8_e4b15 else 0,
+        V_LLOYD_MAX=v_lloyd_max,
         num_warps=4,
         num_stages=1,
     )
@@ -513,7 +616,6 @@ def _fused_store_block_diag(
     Key_raw_ptr,      # [NH, D] float32
     Value_ptr,        # [NH, D] float32
     Coeffs_ptr,       # [B, D] float32 — precomputed block-rotation coefficients
-    Scratch_ptr,      # [NH, D] float32 — gather scratch
     Midpoints_ptr,
     KV_cache_ptr,
     Slot_mapping_ptr,
@@ -533,9 +635,30 @@ def _fused_store_block_diag(
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
+    KEY_FP8: tl.constexpr = 0,
+    FP8_E4B15: tl.constexpr = 0,
+    V_LLOYD_MAX: tl.constexpr = 0,
 ):
-    """Block-diagonal in-kernel rotation: normalize → block-rotate via
-    B HBM scratch gathers → fused store."""
+    """Block-diagonal in-kernel rotation: normalize → in-register
+    block rotation (no HBM scratch) → fused store.
+
+    The previous implementation staged `x_hat` to a per-program HBM
+    scratch and re-loaded `B` permuted views from it for the rotation.
+    That path was needed for RHT's butterfly because every stage's
+    partner indices are XOR-based across the whole tile, but for the
+    block-diagonal case the partner index is just `(d // B) * B + k`,
+    a small *strided* gather. The compiler can serve those B re-loads
+    of `Key_raw_ptr + base + partner_pos` from L1/L2 (the whole `D`-byte
+    row is already in cache from the norm load), so we skip the scratch
+    round-trip entirely. Each call now does:
+
+      1 raw-K load (norm pass) + B raw-K cache hits + B coeff loads
+    instead of
+      1 raw-K load + 1 scratch store + B scratch loads + B coeff loads.
+
+    Net: `(B+1) * BLOCK_D * 4` fewer scratch bytes per call, no
+    `tl.debug_barrier()`. Removes the scratch allocation entirely from
+    the launcher."""
     pid = tl.program_id(0)
     slot, slot_base = _slot_base(
         Slot_mapping_ptr, pid, H, BLOCK_SIZE,
@@ -545,43 +668,44 @@ def _fused_store_block_diag(
         return
 
     base = pid * D
-    scratch_off = pid * D
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
 
-    # ── 0. Load raw K, compute norm, normalize ─────────────────────
+    # ── 0. Load raw K, compute norm ─────────────────────────────────
     k_raw = tl.load(Key_raw_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
     norm_sq = tl.sum(k_raw * k_raw, axis=0)
     norm = tl.sqrt(norm_sq + 1e-16)
-    x_hat = k_raw / (norm + 1e-8)
+    inv_norm = 1.0 / (norm + 1e-8)
 
-    # ── 1. Stage x_hat for cross-lane gather ───────────────────────
-    tl.store(Scratch_ptr + scratch_off + d_offs, x_hat, mask=d_mask)
-    tl.debug_barrier()
-
-    # ── 2. Block-wise rotation: y[d] = Σ_k coeffs[k, d] · x[group_start + k] ─
+    # ── 1. Block-wise rotation: y[d] = Σ_k coeffs[k, d] · x_hat[group_start + k]
+    # Each iteration re-reads `Key_raw_ptr + base + partner_pos` (an L1
+    # hit after the norm-pass load), normalizes per lane, and fuses with
+    # the `coeffs[k, d]` row. No cross-lane HBM scratch.
     group_start = (d_offs // B) * B
     y_vec = tl.zeros([BLOCK_D], dtype=tl.float32)
     for k in tl.static_range(B):
         partner_pos = group_start + k
         partner_mask = (partner_pos < D) & d_mask
-        x_k = tl.load(
-            Scratch_ptr + scratch_off + partner_pos,
+        k_at_partner = tl.load(
+            Key_raw_ptr + base + partner_pos,
             mask=partner_mask, other=0.0,
-        )
+        ).to(tl.float32)
+        x_at_partner = k_at_partner * inv_norm
         coeff_k = tl.load(
             Coeffs_ptr + k * D + d_offs,
             mask=d_mask, other=0.0,
         )
-        y_vec = y_vec + x_k * coeff_k
+        y_vec = y_vec + x_at_partner * coeff_k
 
-    # ── 3-6. Bucketize + pack + norm + V quant + slot scatter ──────
+    # ── 2-5. Bucketize + pack + norm + V quant + slot scatter ──────
     _bucketize_pack_norm_v_store(
         y_vec, norm, Value_ptr, Midpoints_ptr, KV_cache_ptr,
         base, slot_base, d_offs, d_mask,
         D=D, BLOCK_D=BLOCK_D, MSE_BYTES=MSE_BYTES, KPS=KPS,
         VQB=VQB, VAL_DATA_BYTES=VAL_DATA_BYTES, BLOCK_VAL=BLOCK_VAL,
         MSE_BITS=MSE_BITS, N_CENTROIDS=N_CENTROIDS, BLOCK_GRP=BLOCK_GRP,
+        KEY_FP8=KEY_FP8, FP8_E4B15=FP8_E4B15,
+        V_LLOYD_MAX=V_LLOYD_MAX,
     )
 
 
@@ -602,19 +726,23 @@ def _launch_block_diag(
     cache_bs = kv_cache.shape[1]
     BLOCK_D = triton.next_power_of_2(D)
 
-    mse_bytes = math.ceil(D * tq_config.key_mse_bits / 8)
-    n_centroids = 2 ** tq_config.key_mse_bits
+    key_fp8 = bool(getattr(tq_config, "key_fp8", False))
+    import os as _os
+    v_lloyd_max = 1 if _os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1" else 0
+    eff_mse_bits = tq_config.key_mse_bits if not key_fp8 else 2
+    mse_bytes = math.ceil(D * eff_mse_bits / 8) if not key_fp8 else 0
+    n_centroids = 2 ** eff_mse_bits
     val_data_bytes = math.ceil(D * tq_config.effective_value_quant_bits / 8)
     BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
     BLOCK_GRP = triton.next_power_of_2(D // 8) if D >= 8 else 1
+    fp8_e4b15 = _use_fp8_e4b15(key.device) if key_fp8 else False
 
     k_flat = key.float().reshape(NH, D).contiguous()
     v_flat = value.float().reshape(NH, D).contiguous()
-    scratch = torch.empty((NH, D), dtype=torch.float32, device=key.device)
 
     grid = (NH,)
     _fused_store_block_diag[grid](
-        k_flat, v_flat, coeffs, scratch, midpoints,
+        k_flat, v_flat, coeffs, midpoints,
         kv_cache.view(-1), slot_mapping,
         stride_cache_block=kv_cache.stride(0),
         stride_cache_pos=kv_cache.stride(1),
@@ -629,9 +757,12 @@ def _launch_block_diag(
         VQB=tq_config.effective_value_quant_bits,
         VAL_DATA_BYTES=val_data_bytes,
         BLOCK_VAL=BLOCK_VAL,
-        MSE_BITS=tq_config.key_mse_bits,
+        MSE_BITS=eff_mse_bits,
         N_CENTROIDS=n_centroids,
         BLOCK_GRP=BLOCK_GRP,
+        KEY_FP8=1 if key_fp8 else 0,
+        FP8_E4B15=1 if fp8_e4b15 else 0,
+        V_LLOYD_MAX=v_lloyd_max,
         num_warps=4,
         num_stages=1,
     )
@@ -653,11 +784,16 @@ def _launch_matrix(
     block_size = kv_cache.shape[1]
     BLOCK_D = triton.next_power_of_2(D)
 
-    mse_bytes = math.ceil(D * tq_config.key_mse_bits / 8)
-    n_centroids = 2 ** tq_config.key_mse_bits
+    key_fp8 = bool(getattr(tq_config, "key_fp8", False))
+    import os as _os
+    v_lloyd_max = 1 if _os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1" else 0
+    eff_mse_bits = tq_config.key_mse_bits if not key_fp8 else 2
+    mse_bytes = math.ceil(D * eff_mse_bits / 8) if not key_fp8 else 0
+    n_centroids = 2 ** eff_mse_bits
     val_data_bytes = math.ceil(D * tq_config.effective_value_quant_bits / 8)
     BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
     BLOCK_GRP = triton.next_power_of_2(D // 8) if D >= 8 else 1
+    fp8_e4b15 = _use_fp8_e4b15(key.device) if key_fp8 else False
 
     k_flat = key.float().reshape(NH, D).contiguous()
     v_flat = value.float().reshape(NH, D).contiguous()
@@ -678,9 +814,12 @@ def _launch_matrix(
         VQB=tq_config.effective_value_quant_bits,
         VAL_DATA_BYTES=val_data_bytes,
         BLOCK_VAL=BLOCK_VAL,
-        MSE_BITS=tq_config.key_mse_bits,
+        MSE_BITS=eff_mse_bits,
         N_CENTROIDS=n_centroids,
         BLOCK_GRP=BLOCK_GRP,
+        KEY_FP8=1 if key_fp8 else 0,
+        FP8_E4B15=1 if fp8_e4b15 else 0,
+        V_LLOYD_MAX=v_lloyd_max,
         num_warps=4,
         num_stages=1,
     )
