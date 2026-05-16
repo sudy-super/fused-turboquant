@@ -83,6 +83,7 @@ def _tq_decode_stage1_offset(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    V_LLOYD_MAX: tl.constexpr = 0,  # 1 = V uses Lloyd-Max + per-vec norm (shares K centroids)
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -352,7 +353,7 @@ def _tq_decode_stage1_offset(
                 mask=kv_mask[:, None] & d_mask[None, :],
                 other=0,
             ).to(tl.int32)
-            v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
+            v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.int32)
 
             sc_bases = val_bases + VAL_DATA_BYTES
             sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
@@ -361,17 +362,40 @@ def _tq_decode_stage1_offset(
             sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
                 tl.uint16
             )
-            v_scales = (
+            v_meta = (
                 (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
             )
-            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+
+            if V_LLOYD_MAX:
+                # Lloyd-Max V: v_meta is per-vector norm. Centroids are the
+                # same as K's (shared `Centroids_ptr`). values[kv, d] = c[v_idx] * v_norm[kv]
+                v_centroids = tl.load(
+                    Centroids_ptr + v_idx,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                # Norm correction: re-normalize the centroid vector to unit
+                # norm before scaling by the stored per-vector norm. Lloyd-Max
+                # quantization shrinks ||dequant(idx)|| below 1 on average, so
+                # without this the reconstructed values systematically have
+                # the wrong magnitude (same fix the K path uses).
+                if NORM_CORRECTION:
+                    vc_norm_sq = tl.sum(
+                        tl.where(d_mask[None, :], v_centroids * v_centroids, 0.0),
+                        axis=1,
+                    )
+                    vc_inv_norm = 1.0 / tl.sqrt(vc_norm_sq + 1e-16)
+                    v_centroids = v_centroids * vc_inv_norm[:, None]
+                values = v_centroids * v_meta[:, None]
+            else:
+                zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
+                    tl.uint16
+                )
+                zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
+                    tl.uint16
+                )
+                v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+                values = v_idx.to(tl.float32) * v_meta[:, None] + v_zeros[:, None]
 
         # ============================================================
         # WEIGHTED VALUE ACCUMULATION

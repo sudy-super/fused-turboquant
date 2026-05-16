@@ -338,13 +338,24 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         is_boundary_layer = not (
             isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_")
         )
-        self._is_raw = is_boundary_layer and not isinstance(bp_mode, int)
-        # When the boundary mode is a bit count, advance into the TQ
-        # setup path below — but synthesize a TurboQuantConfig at the
-        # override bits (and re-derive the spec from there). Track this
-        # so downstream code knows we're a boundary TQ layer sitting in
-        # an oversized FP16 slot.
-        self._boundary_tq_bits = bp_mode if is_boundary_layer and isinstance(bp_mode, int) else None
+        # bp_mode possible values:
+        #   "off"  — no protection (boundary layers are regular TQ)
+        #   "fp16" — boundary stored as raw FP16 (`_is_raw=True`)
+        #   "fp8"  — boundary stored as FP8 keys (8-bit, no LUT)
+        #   int N  — boundary stored as N-bit MSE keys (Lloyd-Max LUT)
+        is_raw_mode = bp_mode == "fp16"
+        is_fp8_mode = bp_mode == "fp8"
+        is_bits_mode = isinstance(bp_mode, int)
+        self._is_raw = is_boundary_layer and is_raw_mode
+        if is_boundary_layer and is_fp8_mode:
+            self._boundary_tq_bits = 8
+            self._boundary_tq_use_fp8 = True
+        elif is_boundary_layer and is_bits_mode:
+            self._boundary_tq_bits = bp_mode
+            self._boundary_tq_use_fp8 = False
+        else:
+            self._boundary_tq_bits = None
+            self._boundary_tq_use_fp8 = False
 
         if self._is_raw:
             # We still need fa_version for the vectorized _forward_raw
@@ -352,6 +363,23 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             # block_table.
             from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
             self.fa_version = get_flash_attn_version(head_size=head_size)
+            # vLLM's plugin forces flash_attn_version=2 for the TURBOQUANT
+            # backend, but `_forward_raw` (when re-enabled via
+            # TQ_BOUNDARY_FA_PAGED=1) doesn't actually use any of the
+            # FA-version-restricted features. On Blackwell (SM ≥ 10) we
+            # can prefer FA4 if it's available.
+            if (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability(0)[0] >= 10
+            ):
+                try:
+                    from vllm.vllm_flash_attn.flash_attn_interface import (
+                        is_fa_version_supported,
+                    )
+                    if is_fa_version_supported(4):
+                        self.fa_version = 4
+                except ImportError:
+                    pass
             logger.info(
                 "FusedTurboQuantV1Impl init: raw fp16 fallback (kv_cache_dtype=%s, "
                 "boundary-protection layer). head_size=%d num_heads=%d "
@@ -372,22 +400,35 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         )
 
         if self._boundary_tq_bits is not None:
-            # Boundary layer with quantized override. We sit in a
-            # FP16-sized slot but speak TQ at the override bit width.
+            # Boundary layer with TQ override. We sit in a FP16-sized
+            # slot but speak TQ at the override bit width. Use our own
+            # config wrapper so the 8-bit case can be either FP8 OR
+            # MSE@8bit (the vLLM stock config hard-codes 8 → FP8).
+            from fused_turboquant.vllm_plugin.boundary_tq_config import (
+                BoundaryTurboQuantConfig,
+            )
             bits = self._boundary_tq_bits
-            self.tq_config = TurboQuantConfig(
+            self.tq_config = BoundaryTurboQuantConfig(
                 head_dim=head_size,
                 key_quant_bits=bits,
                 value_quant_bits=bits,
                 norm_correction=True,
+                key_use_fp8_at_8bit=self._boundary_tq_use_fp8,
             )
         else:
             self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
-        if self.tq_config.key_fp8:
+        # FP8 keys: still no specialized store kernel in our refactor.
+        # Allowed only as a boundary override (handled via the dispatch
+        # path), and even then only when the user explicitly opted in
+        # via TURBOQUANT_BOUNDARY_PROTECT=fp8.
+        if self.tq_config.key_fp8 and self._boundary_tq_bits is None:
             raise NotImplementedError(
-                "FP8 keys (turboquant_k8v4) are not yet supported by this "
-                "refactor — use turboquant_4bit_nc / turboquant_3bit_nc / "
-                "turboquant_k3v4_nc."
+                "FP8 keys (turboquant_k8v4) as the *primary* preset are "
+                "not yet supported by this refactor — use "
+                "turboquant_4bit_nc / turboquant_3bit_nc / "
+                "turboquant_k3v4_nc, or set "
+                "TURBOQUANT_BOUNDARY_PROTECT=fp8 to enable FP8 only on "
+                "boundary layers."
             )
 
         # Independent K / V bit-width override via env vars. vLLM's
@@ -611,7 +652,21 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         scatter in a single launch. The base-class fallback
         (`RotationStrategy.launch_store`) handles strategies that don't
         yet ship an in-kernel variant.
+
+        When `TURBOQUANT_V_LLOYD_MAX=1` or `TURBOQUANT_V_ROTATE=1`, V is
+        pre-rotated by the same rotation matrix that K uses. The
+        post-attention inverse rotation is applied in
+        `_decode_attention_offset_only` after stage2. `_V_LLOYD_MAX=1`
+        additionally swaps the V quant from per-vec uniform to shared
+        Lloyd-Max centroids; `_V_ROTATE=1` keeps the existing uniform
+        codec so we can isolate the contribution of rotation alone.
         """
+        if (os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1"
+                or os.environ.get("TURBOQUANT_V_ROTATE", "0") == "1"):
+            M = getattr(layer, "_fused_tq_rotation", None)
+            if M is not None:
+                value = torch.einsum("nhd,de->nhe", value.float(), M).to(value.dtype)
+
         self.rotation.launch_store(
             key=key,
             value=value,
@@ -733,10 +788,14 @@ class FusedTurboQuantV1Impl(AttentionImpl):
 
         # Bit widths outside vLLM's stock 3/4-bit support (2-bit and 8-bit)
         # go through our forked offset kernel where those branches live,
-        # with kv_start_offset=0 so semantics match stock stage1.
+        # with kv_start_offset=0 so semantics match stock stage1. Also force
+        # the offset path whenever the user enabled V Lloyd-Max — the stock
+        # vLLM stage1 only knows the uniform-V dequant layout.
         _kbits = self.tq_config.key_mse_bits
         _vbits = self.tq_config.effective_value_quant_bits
-        if _kbits not in (3, 4) or _vbits not in (3, 4):
+        _v_lloyd = os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1"
+        _v_rotate = os.environ.get("TURBOQUANT_V_ROTATE", "0") == "1"
+        if _kbits not in (3, 4) or _vbits not in (3, 4) or _v_lloyd or _v_rotate:
             return self._decode_attention_offset_only(
                 query, kv_cache, attn_metadata, layer
             )
@@ -746,6 +805,8 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             _tq_decode_stage1,
             _use_fp8_e4b15,
         )
+        # Used only when V Lloyd-Max is OFF (env-gated routing happens above
+        # at line ~782; the stock kernel doesn't accept V_LLOYD_MAX).
         from vllm.v1.attention.ops.triton_decode_attention import (
             _fwd_kernel_stage2,
         )
@@ -777,6 +838,8 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
         BLOCK_KV = 4
         grid1 = (B, Hq, NUM_KV_SPLITS)
+        # Stock kernel: no V_LLOYD_MAX support. Reached only when V Lloyd-Max
+        # is disabled (the dispatcher above routes the on case to our offset).
         _tq_decode_stage1[grid1](
             q_rot,
             kv_cache,
@@ -798,7 +861,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             BLOCK_SIZE=block_size,
             NUM_KV_SPLITS=NUM_KV_SPLITS,
             KV_GROUP_SIZE=kv_group_size,
-            MSE_BITS=self.tq_config.key_mse_bits,
+            MSE_BITS=max(self.tq_config.key_mse_bits, 2),
             MSE_BYTES=self._mse_bytes,
             KPS=self.tq_config.key_packed_size,
             VQB=self.tq_config.effective_value_quant_bits,
@@ -806,7 +869,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             ATTN_SCALE=self.scale,
             BLOCK_D=BLOCK_D,
             BLOCK_KV=BLOCK_KV,
-            KEY_FP8=0,  # FP8 not supported in this refactor
+            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
             num_warps=1,
@@ -914,7 +977,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             BLOCK_SIZE=block_size,
             NUM_KV_SPLITS=NUM_KV_SPLITS,
             KV_GROUP_SIZE=kv_group_size,
-            MSE_BITS=self.tq_config.key_mse_bits,
+            MSE_BITS=max(self.tq_config.key_mse_bits, 2),
             MSE_BYTES=self._mse_bytes,
             KPS=self.tq_config.key_packed_size,
             VQB=self.tq_config.effective_value_quant_bits,
@@ -922,9 +985,10 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             ATTN_SCALE=self.scale,
             BLOCK_D=BLOCK_D,
             BLOCK_KV=BLOCK_KV,
-            KEY_FP8=0,
+            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
+            V_LLOYD_MAX=1 if os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1" else 0,
             num_warps=1,
             num_stages=1,
         )
@@ -947,6 +1011,13 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             num_warps=4,
             num_stages=2,
         )
+        # V rotation: stage2 has accumulated in the rotated V space.
+        # Map back to the original V space with a single per-head GEMM.
+        if (os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1"
+                or os.environ.get("TURBOQUANT_V_ROTATE", "0") == "1"):
+            M = getattr(layer, "_fused_tq_rotation", None)
+            if M is not None:
+                output = torch.einsum("bhd,ed->bhe", output, M)
         return output.to(query.dtype)
 
     def _decode_attention_hybrid(
@@ -1074,7 +1145,7 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             BLOCK_SIZE=block_size,
             NUM_KV_SPLITS=NUM_KV_SPLITS,
             KV_GROUP_SIZE=kv_group_size,
-            MSE_BITS=self.tq_config.key_mse_bits,
+            MSE_BITS=max(self.tq_config.key_mse_bits, 2),
             MSE_BYTES=self._mse_bytes,
             KPS=self.tq_config.key_packed_size,
             VQB=self.tq_config.effective_value_quant_bits,
@@ -1082,9 +1153,10 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             ATTN_SCALE=self.scale,
             BLOCK_D=BLOCK_D,
             BLOCK_KV=BLOCK_KV,
-            KEY_FP8=0,
+            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=fp8_e4b15,
+            V_LLOYD_MAX=1 if os.environ.get("TURBOQUANT_V_LLOYD_MAX", "0") == "1" else 0,
             num_warps=1,
             num_stages=1,
         )
@@ -1282,10 +1354,13 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         """Write fp16 K and V into a byte-indexed slot.
 
         Vectorized GPU-side scatter (no `.tolist()` Python loop) so this
-        path is safe under CUDA-graph capture. Negative slots are mapped
-        to slot 0 (and the corresponding write is harmless overwrite
-        since the attention path uses `seq_lens` to bound reads, not the
-        contents of padding slots).
+        path is safe under CUDA-graph capture. Negative slots are vLLM's
+        "padding token" marker (dummy capture data, end-of-sequence,
+        empty decode step); clamping them naïvely to slot 0 corrupts
+        the real K/V at slot 0 — which over a long eval slowly poisons
+        the boundary layers' first-token attention. We instead snapshot
+        slot 0 before the scatter and restore it after iff no valid
+        token actually mapped there.
 
         Slot byte layout:
             [0 .. 2*head_size)            K (fp16 bytes)
@@ -1304,12 +1379,28 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         v_fp16 = value.to(torch.float16).contiguous()
         k_u8 = k_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, k_bytes)
         v_u8 = v_fp16.view(torch.uint8).reshape(n_tokens, self.num_kv_heads, v_bytes)
-        # Flatten (block, pos) → linear slot index. `slot_mapping` already
-        # uses this linear convention.
         flat = kv_cache_u8.view(-1, self.num_kv_heads, kv_cache_u8.shape[-1])
+        # Snapshot slot 0 before the scatter so we can restore it iff no
+        # genuine token mapped there. (slot_mapping == -1) padding entries
+        # clamp to 0 and would otherwise clobber the real K, V at slot 0
+        # — over a long eval this slowly poisons the first-token attention
+        # for the boundary layers. The `(slot_mapping == 0).any()` reduction
+        # produces a 0-dim tensor and the conditional restore goes through
+        # `torch.where`, so the whole block is cudagraph-capturable.
+        slot0_k_backup = flat[0:1, :, :k_bytes].clone()
+        slot0_v_backup = flat[0:1, :, k_bytes : k_bytes + v_bytes].clone()
         safe_slots = slot_mapping.clamp(min=0)
         flat[safe_slots, :, :k_bytes] = k_u8
         flat[safe_slots, :, k_bytes : k_bytes + v_bytes] = v_u8
+        slot0_was_real_target = (slot_mapping == 0).any().view(1, 1, 1)
+        flat[0:1, :, :k_bytes] = torch.where(
+            slot0_was_real_target, flat[0:1, :, :k_bytes], slot0_k_backup,
+        )
+        flat[0:1, :, k_bytes : k_bytes + v_bytes] = torch.where(
+            slot0_was_real_target,
+            flat[0:1, :, k_bytes : k_bytes + v_bytes],
+            slot0_v_backup,
+        )
 
     def _gather_raw_kv(
         self,
@@ -1389,11 +1480,70 @@ class FusedTurboQuantV1Impl(AttentionImpl):
                 query, key, value, kv_cache, attn_metadata, output, N
             )
 
+        # Workaround for the Blackwell + FA paged + non-contiguous K/V
+        # cluster bug: route through a CUDA-graph-capturable path that
+        # never lets flash-attn touch the interleaved `[K|V]`-packed
+        # cache. Prefill is local SDPA on the current K, V (no cache
+        # read, identical to the pre-d34258a python loop). Decode uses
+        # the custom Triton kernel in `triton_boundary_attn.py`, which
+        # reads K/V byte-by-byte (`uint8` loads → bitcast to fp16) to
+        # avoid the stride-2 paged view that FA misreads on SM ≥ 10.
+        #
+        # Opt back into the original FA paged path with
+        # TQ_BOUNDARY_FA_PAGED=1 (e.g. for benchmarking, or on hardware
+        # unaffected by the cluster bug).
+        if os.environ.get("TQ_BOUNDARY_FA_PAGED", "0") != "1":
+            B = attn_metadata.seq_lens.shape[0]
+            if N > B:
+                # Pure prefill (B sequences, each with > 1 query token).
+                # Run SDPA over current K, V — same numerics as
+                # `_sdpa_local` in the python loop. is_causal handles
+                # within-prompt masking.
+                q = query[:N].view(N, self.num_heads, self.head_size)
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                causal = self.attn_type not in (
+                    AttentionType.ENCODER, AttentionType.ENCODER_ONLY,
+                )
+                attn_out = self._sdpa_local(q, k, v, is_causal=causal)
+                if output.ndim == 3:
+                    output[:N] = attn_out.to(output.dtype)
+                else:
+                    output[:N] = attn_out.reshape(N, -1).to(output.dtype)
+                return output
+            # Decode: custom Triton paged attention.
+            from fused_turboquant.vllm_plugin.triton_boundary_attn import (
+                boundary_fp16_decode_attention,
+            )
+            q = query[:N].view(N, self.num_heads, self.head_size).to(torch.float16)
+            # Reshape output buffer to [N, H_q, D] for the kernel write.
+            if output.ndim == 3:
+                out_view = output[:N]
+            else:
+                out_view = output[:N].view(N, self.num_heads, self.head_size)
+            out_view_fp16 = out_view if out_view.dtype == torch.float16 else \
+                torch.empty(N, self.num_heads, self.head_size,
+                            dtype=torch.float16, device=q.device)
+            boundary_fp16_decode_attention(
+                query=q,
+                kv_cache=kv_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                output=out_view_fp16,
+                num_kv_groups=self.num_kv_groups,
+                scale=self.scale,
+            )
+            if out_view.dtype != torch.float16:
+                if output.ndim == 3:
+                    output[:N] = out_view_fp16.to(output.dtype)
+                else:
+                    output[:N] = out_view_fp16.reshape(N, -1).to(output.dtype)
+            return output
+
         # head_size > 256 exceeds flash-attn-2's limit. For pure-decode
         # batches we have a CUDA-graph-capturable alternative: gather a
-        # padded K/V tensor and run PyTorch SDPA (which supports any
-        # head_dim). For mixed / prefill batches we still have to fall
-        # back to the per-sequence Python loop.
+        # padded K/V tensor and run PyTorch SDPA. For mixed / prefill
+        # batches we fall back to the per-sequence Python loop.
         if head_size > 256:
             if (not attn_metadata.is_prefill
                     and self.attn_type == AttentionType.DECODER):
@@ -1407,9 +1557,6 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         kv_fp16 = kv_u8.view(torch.float16).view(
             kv_u8.shape[0], kv_u8.shape[1], kv_u8.shape[2], 2 * head_size,
         )
-        # NB: slicing the last dim yields tensors whose stride along the
-        # H axis is 2*head_size rather than head_size — flash-attn-v2
-        # accepts that via its non-default-stride code path.
         k_cache = kv_fp16[..., :head_size]
         v_cache = kv_fp16[..., head_size:]
 
