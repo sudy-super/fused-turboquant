@@ -92,17 +92,23 @@ def _boundary_protect_mode() -> "str | int":
         return "off"
     if raw in ("1", "fp16", "f16", "bf16", "bfloat16"):
         return "fp16"
+    if raw in ("fp8", "f8"):
+        # Boundary keys as FP8 (1 byte per element, no LUT). Same byte
+        # count as 8-bit MSE but no codebook overhead — slightly worse
+        # quality, slightly less compute.
+        return "fp8"
     try:
         bits = int(raw)
     except ValueError as e:
         raise ValueError(
             f"TURBOQUANT_BOUNDARY_PROTECT={raw!r} not understood. Use 0/off, "
-            f"1/fp16, or a bit count from {{2, 3, 4, 8}}."
+            f"1/fp16, fp8, or a bit count from {{2, 3, 4, 8}}."
         ) from e
     if bits not in (2, 3, 4, 8):
         raise ValueError(
             f"TURBOQUANT_BOUNDARY_PROTECT={bits} not supported. Use one of "
-            f"{{2, 3, 4, 8}} for a quantized boundary, or 1/fp16 for raw."
+            f"{{2, 3, 4, 8}} for an MSE-quantized boundary, or 1/fp16 or "
+            f"fp8 for raw / FP8 boundary."
         )
     return bits
 
