@@ -73,12 +73,13 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))
 
 ### 🔌 vLLM
 
-Python API (オフラインバッチ推論):
+Python API (オフラインバッチ推論)。 ハイパラは Gemma 4 31B Instruct での 300 サンプル GSM-8K 評価で精度劣化 −0.34 pts (97.67% → 97.33%)、 KV cache 9.7× 圧縮を達成した構成 (rht + BP=0 + V_ROTATE + K3V3) を採用:
 
 ```python
 import os
 os.environ["TURBOQUANT_KIND"] = "rht"          # 回転種別 (rht/planar/rotor/iso_fast/iso_full)
-os.environ["TURBOQUANT_BOUNDARY_PROTECT"] = "1" # 推奨: 境界層保護を ON
+os.environ["TURBOQUANT_BOUNDARY_PROTECT"] = "0" # rht は FWHT で boundary 層も gaussian 化されるので BP 不要
+os.environ["TURBOQUANT_V_ROTATE"] = "1"        # V も K と同じ rotation で量子化 (rotorquant 流) — 精度確保に必須
 
 import fused_turboquant.vllm_plugin  # noqa: F401  (TURBOQUANT バックエンドを登録)
 from vllm import LLM, SamplingParams
@@ -87,7 +88,7 @@ llm = LLM(
     model="Qwen/Qwen2.5-3B-Instruct",
     dtype="bfloat16",
     attention_backend="TURBOQUANT",
-    kv_cache_dtype="turboquant_4bit_nc",   # 4-bit K + 4-bit V
+    kv_cache_dtype="turboquant_3bit_nc",   # 3-bit K + 3-bit V (4-bit 比 KV cache -23%)
     enforce_eager=False,                   # CUDA graphs ON (decode を 5–14 倍高速化)
 )
 sp = SamplingParams(max_tokens=128, temperature=0.0)
@@ -98,13 +99,16 @@ print(out[0].outputs[0].text)
 OpenAI 互換 API サーバとして起動する場合:
 
 ```bash
-TURBOQUANT_KIND=rht TURBOQUANT_BOUNDARY_PROTECT=1 \
+TURBOQUANT_KIND=rht TURBOQUANT_BOUNDARY_PROTECT=0 TURBOQUANT_V_ROTATE=1 \
 vllm serve Qwen/Qwen2.5-3B-Instruct \
   --attention-backend TURBOQUANT \
-  --kv-cache-dtype turboquant_4bit_nc
+  --kv-cache-dtype turboquant_3bit_nc
 ```
 
-3-bit でさらに圧縮したい場合は `kv_cache_dtype="turboquant_3bit_nc"` または `turboquant_k3v4_nc` を指定。各モードの効果と推奨設定は [次節 (🎛️ vLLM 性能モード一覧)](#%EF%B8%8F-vllm-性能モード一覧) を参照。
+備考:
+- **`BP=0` は `TURBOQUANT_KIND=rht` 限定で安全**。 block-diag 系 (planar/rotor/iso_fast/iso_full) は boundary 層を gaussian 化しきれないので `BP=fp8` か `BP=1` を併用してください (詳細は次節)。
+- **`TURBOQUANT_V_ROTATE=1` は全 quant 構成で精度に効きます** (Gemma 4 31B + rotor で +4.3〜+72 pts の改善)。 計算オーバーヘッドは per-decode-step の `output @ M^T` GEMM 1 回 (≪ 0.1 ms)。
+- さらに圧縮したい場合は K3V2 / K2V2 (`TURBOQUANT_KEY_BITS=2 TURBOQUANT_VALUE_BITS=2`) で −2.67 pts / 14.6× 圧縮まで実用領域。 各モードの効果と推奨設定は [次節 (🎛️ vLLM 性能モード一覧)](#%EF%B8%8F-vllm-性能モード一覧) を参照。
 
 ## 🎛️ vLLM 性能モード一覧
 
