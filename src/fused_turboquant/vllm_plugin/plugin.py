@@ -322,6 +322,61 @@ def _patch_unify_page_size() -> None:
 _FT_KVDTYPE_PATTERN = re.compile(r"^turboquant_k([1-4])v([1-4])_nc$")
 
 
+# Map between EngineArgs.additional_config["turboquant"] keys and the
+# environment variables our v1_backend / plugin code reads internally.
+# Order matches their reading sites for grep-ability.
+_FT_TQ_CONFIG_ENV_MAP: dict[str, str] = {
+    "kind": "TURBOQUANT_KIND",
+    "boundary_protect": "TURBOQUANT_BOUNDARY_PROTECT",
+    "v_rotate": "TURBOQUANT_V_ROTATE",
+    "v_lloyd_max": "TURBOQUANT_V_LLOYD_MAX",
+    "key_bits": "TURBOQUANT_KEY_BITS",
+    "value_bits": "TURBOQUANT_VALUE_BITS",
+    "defer_prefill": "TURBOQUANT_DEFER_PREFILL",
+    "prefill_fa_version": "TQ_PREFILL_FA_VERSION",
+    "cudagraph_mode": "TQ_CUDAGRAPH_MODE",
+    "boundary_fa_paged": "TQ_BOUNDARY_FA_PAGED",
+}
+
+
+def _ft_coerce_env_value(value) -> str:
+    """Format a single `additional_config["turboquant"][key]` value as a
+    string suitable for an environment variable. Booleans become "0"/"1",
+    everything else falls through to ``str(value)``."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def _ft_apply_turboquant_additional_config(engine_args) -> None:
+    """Read `engine_args.additional_config["turboquant"]` (if any) and
+    project each entry into the corresponding TURBOQUANT_* / TQ_* env
+    var so the rest of the plugin can consume it through the existing
+    code paths. ``os.environ.setdefault`` is used throughout, so an
+    explicit env-var override always wins over a config-supplied
+    default."""
+    extra = getattr(engine_args, "additional_config", None) or {}
+    if not isinstance(extra, dict):
+        return
+    tq = extra.get("turboquant")
+    if not isinstance(tq, dict):
+        return
+    unknown = [k for k in tq if k not in _FT_TQ_CONFIG_ENV_MAP]
+    if unknown:
+        logger.warning(
+            "fused-turboquant: ignoring unknown additional_config['turboquant'] "
+            "keys: %s. Accepted keys: %s",
+            unknown, sorted(_FT_TQ_CONFIG_ENV_MAP.keys()),
+        )
+    for key, env_name in _FT_TQ_CONFIG_ENV_MAP.items():
+        if key not in tq:
+            continue
+        value = tq[key]
+        if value is None:
+            continue
+        os.environ.setdefault(env_name, _ft_coerce_env_value(value))
+
+
 def _ft_remap_kv_cache_dtype(value):
     """If `value` is one of our extended `turboquant_k{K}v{V}_nc` aliases,
     pick the smallest stock TurboQuant preset whose K/V slots are wide
@@ -407,6 +462,10 @@ def _patch_extend_tq_presets() -> None:
         user_fa = getattr(ac, "flash_attn_version", None) if ac is not None else None
         if user_fa in (3, 4):
             os.environ.setdefault("TQ_PREFILL_FA_VERSION", str(user_fa))
+        # Pull every TurboQuant knob out of `additional_config["turboquant"]`
+        # so users don't have to set environment variables. Env vars still
+        # win (setdefault) so existing scripts keep working.
+        _ft_apply_turboquant_additional_config(self)
         original(self)
 
     patched.__wrapped__ = original  # type: ignore[attr-defined]
