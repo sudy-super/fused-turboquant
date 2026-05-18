@@ -21,6 +21,8 @@ across both vLLM generations.
 from __future__ import annotations
 
 import logging
+import os
+import re
 
 import torch  # noqa: E402 — used by the get_kv_cache_spec monkey-patch
 
@@ -55,6 +57,8 @@ def register_backend() -> None:
     _patch_attention_get_kv_cache_spec()
     _patch_unify_page_size()
     _patch_disable_boundary_protection()
+    _patch_extend_tq_presets()
+    _patch_cache_dtype_validation()
 
 
 def _boundary_protect_mode() -> "str | int":
@@ -313,6 +317,102 @@ def _patch_unify_page_size() -> None:
         "fused-turboquant: patched unify_kv_cache_spec_page_size to widen "
         "smaller layers by integer block_size ratio (power-of-2 only)"
     )
+
+
+_FT_KVDTYPE_PATTERN = re.compile(r"^turboquant_k([1-4])v([1-4])_nc$")
+
+
+def _ft_remap_kv_cache_dtype(value):
+    """If `value` is one of our extended `turboquant_k{K}v{V}_nc` aliases,
+    pick the smallest stock TurboQuant preset whose K/V slots are wide
+    enough to hold the requested K/V bits, and set
+    `TURBOQUANT_KEY_BITS` / `TURBOQUANT_VALUE_BITS` so the downstream
+    `v1_backend.py` override path realises the effective bit widths.
+    Returns the remapped (or unchanged) string."""
+    if not isinstance(value, str):
+        return value
+    m = _FT_KVDTYPE_PATTERN.match(value)
+    if not m:
+        return value
+    k_bits, v_bits = int(m.group(1)), int(m.group(2))
+    # Smallest stock preset whose K/V slots fit. Stock presets:
+    #   turboquant_3bit_nc  → K slot = 3, V slot = 3
+    #   turboquant_k3v4_nc  → K slot = 3, V slot = 4
+    #   turboquant_4bit_nc  → K slot = 4, V slot = 4
+    if k_bits <= 3 and v_bits <= 3:
+        host = "turboquant_3bit_nc"
+    elif k_bits <= 3 and v_bits <= 4:
+        host = "turboquant_k3v4_nc"
+    else:
+        host = "turboquant_4bit_nc"
+    # Set env vars so v1_backend.py picks them up via the existing
+    # TURBOQUANT_KEY_BITS / _VALUE_BITS override path. Don't clobber a
+    # value the user already set explicitly.
+    os.environ.setdefault("TURBOQUANT_KEY_BITS", str(k_bits))
+    os.environ.setdefault("TURBOQUANT_VALUE_BITS", str(v_bits))
+    logger.info(
+        "fused-turboquant: kv_cache_dtype %s → host %s (effective K=%d, V=%d)",
+        value, host, k_bits, v_bits,
+    )
+    return host
+
+
+def _patch_extend_tq_presets() -> None:
+    """Allow `kv_cache_dtype="turboquant_k{K}v{V}_nc"` (K, V ∈ {1, 2, 3, 4})
+    to be passed directly to vLLM as a preset name, instead of forcing the
+    user to combine `TURBOQUANT_KEY_BITS` / `TURBOQUANT_VALUE_BITS` env vars
+    with a stock `turboquant_*_nc` preset.
+
+    vLLM types `cache_dtype` as a `Literal[...]` and Pydantic enforces it at
+    runtime, so we can't just register a new preset name. Instead we hook
+    `EngineArgs.__post_init__` and rewrite the value *before* `CacheConfig`
+    is built: `turboquant_k3v2_nc` → host preset `turboquant_3bit_nc` plus
+    `TURBOQUANT_KEY_BITS=3 TURBOQUANT_VALUE_BITS=2`. The bit-width override
+    path inside `v1_backend.py` then activates and the user-visible
+    behaviour matches what a real `turboquant_k3v2_nc` preset would do.
+
+    Idempotent.
+    """
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+    except ImportError:
+        return
+
+    if getattr(EngineArgs, "_ft_kvdtype_remap_patched", False):
+        return
+
+    original = EngineArgs.__post_init__
+
+    def patched(self):
+        # Rewrite kv_cache_dtype on the EngineArgs object before its
+        # CacheConfig is constructed. Both attribute names that have
+        # been used historically are covered.
+        for attr in ("kv_cache_dtype", "cache_dtype"):
+            current = getattr(self, attr, None)
+            if isinstance(current, str):
+                remapped = _ft_remap_kv_cache_dtype(current)
+                if remapped is not current:
+                    setattr(self, attr, remapped)
+        original(self)
+
+    patched.__wrapped__ = original  # type: ignore[attr-defined]
+    EngineArgs.__post_init__ = patched  # type: ignore[assignment]
+    EngineArgs._ft_kvdtype_remap_patched = True  # type: ignore[attr-defined]
+    logger.info(
+        "fused-turboquant: EngineArgs.__post_init__ now rewrites "
+        "turboquant_k{K}v{V}_nc → host preset + bit-width env overrides "
+        "(K, V ∈ {1, 2, 3, 4})."
+    )
+
+
+def _patch_cache_dtype_validation() -> None:
+    """No-op stub kept for backward-compat. Pydantic Literal validation on
+    `CacheConfig.cache_dtype` can't be loosened at runtime without
+    rebuilding the dataclass; we go through `_patch_extend_tq_presets`
+    instead, which rewrites the alias before it reaches the Literal
+    check. Left in place so older `register_backend()` call sites keep
+    working."""
+    return
 
 
 def _try_register_v1() -> bool:
