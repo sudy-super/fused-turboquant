@@ -286,6 +286,36 @@ def _tq_decode_stage1_offset(
             )
             v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
             values = v_idx * v_scales[:, None] + v_zeros[:, None]
+        elif VQB == 1:
+            # 1-bit V: 8 entries per byte, no cross-byte indices.
+            v_byte_idx = d_offs // 8
+            v_bit_shift = d_offs % 8
+            val_addrs = val_bases[:, None] + v_byte_idx[None, :]
+            val_raw = tl.load(
+                KV_cache_ptr + val_addrs,
+                mask=kv_mask[:, None] & d_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            v_idx = ((val_raw >> v_bit_shift[None, :]) & 0x1).to(tl.float32)
+
+            sc_bases = val_bases + VAL_DATA_BYTES
+            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_scales = (
+                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            )
+            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
+                tl.uint16
+            )
+            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            values = v_idx * v_scales[:, None] + v_zeros[:, None]
         elif VQB == 2:
             # 2-bit V: 4 entries per byte, no cross-byte indices.
             v_byte_idx = d_offs // 4

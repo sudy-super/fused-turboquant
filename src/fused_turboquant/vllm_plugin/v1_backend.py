@@ -447,10 +447,10 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             preset_v = self.tq_config.value_quant_bits
             new_k = int(key_override) if key_override is not None else preset_k
             new_v = int(val_override) if val_override is not None else preset_v
-            if not (2 <= new_k <= 4) or not (2 <= new_v <= 4):
+            if not (1 <= new_k <= 4) or not (1 <= new_v <= 4):
                 raise ValueError(
                     f"TURBOQUANT_KEY_BITS / TURBOQUANT_VALUE_BITS must be in "
-                    f"{{2, 3, 4}}; got K={new_k}, V={new_v}."
+                    f"{{1, 2, 3, 4}}; got K={new_k}, V={new_v}."
                 )
             if new_k > preset_k or new_v > preset_v:
                 raise ValueError(
