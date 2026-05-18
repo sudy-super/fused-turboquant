@@ -135,6 +135,15 @@ def _bucketize_pack_norm_v_store(
             packed = idx_q.to(tl.uint8)
             mse_mask_8 = d_offs < MSE_BYTES
             tl.store(KV_cache_ptr + slot_base + d_offs, packed, mask=mse_mask_8)
+        elif MSE_BITS == 1:
+            # 8 binary indices per byte (2 centroids: ±0.798/√d Lloyd-Max
+            # 1-bit optimal). Pack low-to-high bit order to match decode.
+            idx_oct = tl.reshape(idx_q, [BLOCK_D // 8, 8])
+            shifts_1 = tl.arange(0, 8)
+            packed = tl.sum((idx_oct & 0x1) << shifts_1[None, :], axis=1).to(tl.uint8)
+            mse_offs_1 = tl.arange(0, BLOCK_D // 8)
+            mse_mask_1 = mse_offs_1 < MSE_BYTES
+            tl.store(KV_cache_ptr + slot_base + mse_offs_1, packed, mask=mse_mask_1)
 
         # ── 3. STORE NORM (fp16, 2 bytes) ──────────────────────────────
         norm_offset = MSE_BYTES
@@ -193,7 +202,33 @@ def _bucketize_pack_norm_v_store(
     val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
     val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
 
-    if VQB == 3:
+    if VQB == 1:
+        # 1-bit uniform: 2 levels, packed 8 entries per byte.
+        v_scale = (val_max - val_min)
+        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+        q_all = tl.minimum(
+            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 1
+        )
+        q_oct = tl.reshape(q_all, [BLOCK_D // 8, 8])
+        shifts_v1 = tl.arange(0, 8)
+        packed_val = tl.sum((q_oct & 0x1) << shifts_v1[None, :], axis=1).to(tl.uint8)
+        val_offs = tl.arange(0, BLOCK_D // 8)
+        val_mask = val_offs < VAL_DATA_BYTES
+        tl.store(
+            KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+            packed_val,
+            mask=val_mask,
+        )
+        sc_offset = val_cache_offset + VAL_DATA_BYTES
+        sc_f16 = v_scale.to(tl.float16)
+        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 1, ((sc_u16 >> 8) & 0xFF).to(tl.uint8))
+        zr_f16 = val_min.to(tl.float16)
+        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + slot_base + sc_offset + 3, ((zr_u16 >> 8) & 0xFF).to(tl.uint8))
+    elif VQB == 3:
         v_scale = (val_max - val_min) / 7.0
         v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
         q_vals = tl.minimum(
