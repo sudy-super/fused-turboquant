@@ -109,6 +109,7 @@ vllm serve Qwen/Qwen2.5-3B-Instruct \
 - **`BP=0` は `TURBOQUANT_KIND=rht` 限定で安全**。 block-diag 系 (planar/rotor/iso_fast/iso_full) は boundary 層を gaussian 化しきれないので `BP=fp8` か `BP=1` を併用してください (詳細は次節)。
 - **`TURBOQUANT_V_ROTATE=1` は全 quant 構成で精度に効きます** (Gemma 4 31B + rotor で +4.3〜+72 pts の改善)。 計算オーバーヘッドは per-decode-step の `output @ M^T` GEMM 1 回 (≪ 0.1 ms)。
 - さらに圧縮したい場合は **`kv_cache_dtype="turboquant_k3v2_nc"`** (−1.34 pts / 13.8× 圧縮) や **`turboquant_k2v2_nc"`** (−2.67 pts / 14.6× 圧縮) のように直接プリセット名で指定可能。 K, V ∈ {1, 2, 3, 4} の全 16 通り (`turboquant_k{K}v{V}_nc`) を受け付けます。 各モードの効果と推奨設定は [次節 (🎛️ vLLM 性能モード一覧)](#%EF%B8%8F-vllm-性能モード一覧) を参照。
+- **prefill の FlashAttention バージョン**は `AttentionConfig(flash_attn_version=4)` (CLI: `--attention-config.flash_attn_version=4`) で指定可能。 vLLM stock は TurboQuant 使用時に強制 FA2 化するが、 本 plugin が `attention_config.flash_attn_version` を `TQ_PREFILL_FA_VERSION` に転記して上書きするため、 FA3 / FA4 が使える GPU では prefill だけ高速化できる。 SM 12 (RTX PRO 6000 Blackwell) では vLLM 0.20.0 の FA4 backend (`FlashAttentionForwardSm120`)に未修正バグがあり runtime で FA2 に fallback します (ログ 1 回)。 Hopper SM 9 や B100/B200 では FA3/FA4 が実効的に有効。
 
 ## 🎛️ vLLM 性能モード一覧
 
