@@ -440,13 +440,44 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         # must be ≤ the preset's bits — pick the smallest preset whose
         # K, V slots fit the desired widths (`turboquant_4bit_nc` is a
         # safe maximal choice).
+        # First, check if the preset itself carries an effective-bits hint
+        # (set by `_patch_extend_tq_presets` for the synthesized
+        # turboquant_k{K}v{V}_nc presets). The K/V env vars still win over
+        # the preset's own effective hint, so a user can layer overrides on
+        # top of e.g. turboquant_k3v3_nc.
+        try:
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TQ_PRESETS,
+            )
+        except ImportError:
+            TQ_PRESETS = {}
+        _preset_info = TQ_PRESETS.get(kv_cache_dtype, {}) if isinstance(
+            kv_cache_dtype, str
+        ) else {}
+        preset_eff_k = _preset_info.get("effective_key_bits")
+        preset_eff_v = _preset_info.get("effective_value_bits")
+
         key_override = os.environ.get("TURBOQUANT_KEY_BITS")
         val_override = os.environ.get("TURBOQUANT_VALUE_BITS")
-        if key_override is not None or val_override is not None:
+        if (
+            key_override is not None
+            or val_override is not None
+            or preset_eff_k is not None
+            or preset_eff_v is not None
+        ):
             preset_k = self.tq_config.key_quant_bits
             preset_v = self.tq_config.value_quant_bits
-            new_k = int(key_override) if key_override is not None else preset_k
-            new_v = int(val_override) if val_override is not None else preset_v
+            # Precedence: env var > preset effective hint > preset slot width.
+            new_k = (
+                int(key_override) if key_override is not None
+                else preset_eff_k if preset_eff_k is not None
+                else preset_k
+            )
+            new_v = (
+                int(val_override) if val_override is not None
+                else preset_eff_v if preset_eff_v is not None
+                else preset_v
+            )
             if not (1 <= new_k <= 4) or not (1 <= new_v <= 4):
                 raise ValueError(
                     f"TURBOQUANT_KEY_BITS / TURBOQUANT_VALUE_BITS must be in "
@@ -459,16 +490,21 @@ class FusedTurboQuantV1Impl(AttentionImpl):
                     f"V={preset_v}). Pick a larger preset such as "
                     f"turboquant_4bit_nc and override down from there."
                 )
-            self.tq_config = TurboQuantConfig(
-                head_dim=head_size,
-                key_quant_bits=new_k,
-                value_quant_bits=new_v,
-                norm_correction=self.tq_config.norm_correction,
-            )
-            logger.info(
-                "TURBOQUANT bit-width override: K=%d, V=%d (preset slot was K=%d, V=%d)",
-                new_k, new_v, preset_k, preset_v,
-            )
+            # Only swap the config if the effective bits actually differ
+            # from the preset slot bits — otherwise the preset is already
+            # at the right effective bits and we save a TurboQuantConfig
+            # rebuild.
+            if new_k != preset_k or new_v != preset_v:
+                self.tq_config = TurboQuantConfig(
+                    head_dim=head_size,
+                    key_quant_bits=new_k,
+                    value_quant_bits=new_v,
+                    norm_correction=self.tq_config.norm_correction,
+                )
+                logger.info(
+                    "TURBOQUANT bit-width: K=%d, V=%d (preset %s slot K=%d V=%d)",
+                    new_k, new_v, kv_cache_dtype, preset_k, preset_v,
+                )
 
         kind = _env_str("TURBOQUANT_KIND", "rht")
         try:
