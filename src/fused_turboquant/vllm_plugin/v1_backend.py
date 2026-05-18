@@ -67,6 +67,13 @@ from fused_turboquant.vllm_plugin.rotation import (
 logger = logging.getLogger(__name__)
 
 
+# Module-level latch: once any layer's prefill FA call fails (Blackwell SM 12
+# hitting vLLM 0.20's incomplete FA4 backend, etc.), every subsequent layer
+# downshifts to FA2 immediately instead of repeating the same
+# AttributeError + warning cycle 32–60 times per request.
+_FT_PREFILL_FA_RUNTIME_FAILED = False
+
+
 # ---------------------------------------------------------------------------
 # Lazy vLLM imports (kept tight — only kernel ops + the AttentionImpl base).
 # ---------------------------------------------------------------------------
@@ -528,6 +535,35 @@ class FusedTurboQuantV1Impl(AttentionImpl):
         from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 
         self.fa_version = get_flash_attn_version(head_size=head_size)
+        # vLLM stock pins TurboQuant to FlashAttention 2 in
+        # `arg_utils.py:2003-2014` (the FA3+ backend asserts every layer is a
+        # FlashAttentionImpl, which TurboQuantAttentionImpl is not). That
+        # global pin only affects vLLM's own FA backend initialisation —
+        # the `flash_attn_varlen_func` we call directly from
+        # `_flash_attn_varlen` accepts a per-call `fa_version=` kwarg that
+        # overrides whatever the vLLM-wide config says.
+        #
+        # Allow opting in to FA4 explicitly via `TQ_PREFILL_FA_VERSION=4`.
+        # We don't auto-upgrade because `is_fa_version_supported(4)` reports
+        # False on some otherwise-Blackwell SKUs (e.g. RTX PRO 6000 / SM 12)
+        # where the FA4 build hasn't enumerated the SM. A runtime fallback
+        # inside `_flash_attn_varlen` catches the case where the FA4 kernel
+        # genuinely refuses to run and silently downshifts to FA2.
+        _requested_prefill_fa = os.environ.get("TQ_PREFILL_FA_VERSION", "")
+        if _requested_prefill_fa:
+            try:
+                _requested_int = int(_requested_prefill_fa)
+            except ValueError:
+                _requested_int = None
+            if _requested_int in (2, 3, 4):
+                if self.fa_version != _requested_int:
+                    logger.info(
+                        "FusedTurboQuantV1Impl: prefill FA version "
+                        "%s requested via TQ_PREFILL_FA_VERSION (vLLM "
+                        "globally pinned to %s).",
+                        _requested_int, self.fa_version,
+                    )
+                self.fa_version = _requested_int
 
         # NUM_KV_SPLITS for the decode kernel (stock uses this via config)
         from vllm.config import get_current_vllm_config
@@ -1372,9 +1408,39 @@ class FusedTurboQuantV1Impl(AttentionImpl):
             softmax_scale=self.scale,
             causal=True,
         )
+        # If any layer already tripped over FA3/FA4 in this process, skip
+        # straight to FA2 — vLLM 0.20's FA4 SM-12 path crashes the same way
+        # on every layer's first prefill, so re-trying just wastes setup
+        # time and floods logs.
+        global _FT_PREFILL_FA_RUNTIME_FAILED
+        if _FT_PREFILL_FA_RUNTIME_FAILED and self.fa_version != 2:
+            self.fa_version = 2
         if self.fa_version is not None:
             kwargs["fa_version"] = self.fa_version
-        return flash_attn_varlen_func(**kwargs)
+        try:
+            return flash_attn_varlen_func(**kwargs)
+        except (RuntimeError, NotImplementedError, AttributeError) as e:
+            # The requested FA version refused to run on this device.
+            # Observed in vLLM 0.20.0 on Blackwell SM 12:
+            #   - FA4 backend (`FlashAttentionForwardSm120`) hits
+            #     `AttributeError: object has no attribute 'is_split_kv'`
+            #     inside the cute / kernel build.
+            #   - FA3 isn't compiled in for SM 12 at all.
+            # Latch the failure so we don't retry every step (process-wide
+            # — every layer's Impl checks this flag on its next call), and
+            # fall back to FA2.
+            if kwargs.get("fa_version") != 2:
+                if not _FT_PREFILL_FA_RUNTIME_FAILED:
+                    logger.warning(
+                        "FusedTurboQuantV1Impl: FA v%s rejected at runtime (%s); "
+                        "falling back to FA2 for the rest of this process.",
+                        kwargs.get("fa_version"), e,
+                    )
+                _FT_PREFILL_FA_RUNTIME_FAILED = True
+                self.fa_version = 2
+                kwargs["fa_version"] = 2
+                return flash_attn_varlen_func(**kwargs)
+            raise
 
     # ------------------------------------------------------------------
     # Raw fp16 SDPA fallback (boundary-protection skip layers)

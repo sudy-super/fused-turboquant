@@ -393,6 +393,20 @@ def _patch_extend_tq_presets() -> None:
                 remapped = _ft_remap_kv_cache_dtype(current)
                 if remapped is not current:
                     setattr(self, attr, remapped)
+        # Carry the user-requested `attention_config.flash_attn_version`
+        # through to our TURBOQUANT prefill path. vLLM's TurboQuant pin
+        # at `arg_utils.py:2003-2014` is about to overwrite anything
+        # `>= 3` with `2` (because vLLM's own FA3+ backend asserts
+        # FlashAttentionImpl, which TurboQuantAttentionImpl is not), so
+        # we capture the user's preference *before* `original(self)`
+        # runs and stash it in `TQ_PREFILL_FA_VERSION`. The plugin's
+        # per-call `flash_attn_varlen_func(fa_version=...)` reads that
+        # env var and routes around the vLLM pin. `setdefault` keeps an
+        # explicit env-var override winning over the config field.
+        ac = getattr(self, "attention_config", None)
+        user_fa = getattr(ac, "flash_attn_version", None) if ac is not None else None
+        if user_fa in (3, 4):
+            os.environ.setdefault("TQ_PREFILL_FA_VERSION", str(user_fa))
         original(self)
 
     patched.__wrapped__ = original  # type: ignore[attr-defined]
@@ -401,7 +415,10 @@ def _patch_extend_tq_presets() -> None:
     logger.info(
         "fused-turboquant: EngineArgs.__post_init__ now rewrites "
         "turboquant_k{K}v{V}_nc → host preset + bit-width env overrides "
-        "(K, V ∈ {1, 2, 3, 4})."
+        "(K, V ∈ {1, 2, 3, 4}), and forwards "
+        "attention_config.flash_attn_version → TQ_PREFILL_FA_VERSION "
+        "so users can pick FA3 / FA4 via the LLM(...) kwarg instead of "
+        "an environment variable."
     )
 
 
