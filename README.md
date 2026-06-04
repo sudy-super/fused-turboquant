@@ -86,18 +86,16 @@ llm = LLM(
     model="Qwen/Qwen2.5-3B-Instruct",
     dtype="bfloat16",
     attention_backend="TURBOQUANT",
-    enforce_eager=False,              # CUDA graphs ON (decode を 5–14 倍高速化)
+    kv_cache_dtype="turboquant_k3v3_nc",   # 3-bit K + 3-bit V
+    enforce_eager=False,                   # CUDA graphs ON (decode を 5–14 倍高速化)
     additional_config={
         "turboquant": {
             "kind": "rht",            # 回転種別 (rht/planar/rotor/iso_fast/iso_full)
-            "key_bits": 3,            # K の実効 bit 幅 (1〜4)
-            "value_bits": 3,          # V の実効 bit 幅 (1〜4) — 例えば 2 にすれば K3V2 (13.8× 圧縮)
-            "boundary_protect": 0,    # rht は FWHT で boundary 層も gaussian 化されるので BP 不要
-            "v_rotate": True,         # V も K と同じ rotation で量子化 (rotorquant 流) — 精度に必須
+            "boundary_protect": 0,
+            "v_rotate": True,         # Valueも回転
         },
     },
 )
-
 sp = SamplingParams(max_tokens=128, temperature=0.0)
 out = llm.generate(["The capital of France is"], sp)
 print(out[0].outputs[0].text)
@@ -108,10 +106,11 @@ OpenAI 互換 API サーバとして起動する場合:
 ```bash
 vllm serve Qwen/Qwen2.5-3B-Instruct \
   --attention-backend TURBOQUANT \
-  --additional-config '{"turboquant": {"kind": "rht", "key_bits": 3, "value_bits": 3, "boundary_protect": 0, "v_rotate": true}}'
+  --kv-cache-dtype turboquant_k3v3_nc \
+  --additional-config '{"turboquant": {"kind": "rht", "boundary_protect": 0, "v_rotate": true}}'
 ```
 
-> `kv_cache_dtype` は未指定で OK (plugin が `key_bits` / `value_bits` から最小フィット host preset を自動補填します)。 `additional_config["turboquant"]` の全 key、 性能モード一覧、 K / V 独立 bit 幅 の全 16 プリセット、 境界層保護の bit 幅指定、 スロットレイアウトと実効メモリ消費の仕様は [docs/vllm.md](docs/vllm.md) を参照してください。
+> `kv_cache_dtype` を省略し `additional_config["turboquant"]` に `key_bits` / `value_bits` を渡す書き方も可 (plugin が最小フィット host preset を自動補填)。 `additional_config["turboquant"]` の全 key、 性能モード一覧、 K / V 独立 bit 幅 の全 16 プリセット、 境界層保護の bit 幅指定、 スロットレイアウトと実効メモリ消費の仕様は [docs/vllm.md](docs/vllm.md) を参照してください。
 
 ## 📦 Installation
 
