@@ -377,6 +377,71 @@ def _ft_apply_turboquant_additional_config(engine_args) -> None:
         os.environ.setdefault(env_name, _ft_coerce_env_value(value))
 
 
+def _ft_pick_host_preset(k_bits: int, v_bits: int) -> str:
+    """Smallest stock TurboQuant preset whose K/V slots fit the requested
+    effective bit widths. Shared between the kv_cache_dtype alias remap
+    and the auto-fill path."""
+    if k_bits <= 3 and v_bits <= 3:
+        return "turboquant_3bit_nc"
+    if k_bits <= 3 and v_bits <= 4:
+        return "turboquant_k3v4_nc"
+    return "turboquant_4bit_nc"
+
+
+def _ft_auto_fill_kv_cache_dtype(engine_args) -> None:
+    """Auto-pick a TurboQuant host preset for `kv_cache_dtype` when the user
+    signals TurboQuant intent but left `kv_cache_dtype` at the default
+    (`None` / `"auto"`):
+
+      - `attention_backend="TURBOQUANT"` is set, **or**
+      - `additional_config["turboquant"]` contains `key_bits` / `value_bits`.
+
+    The preset is the smallest stock one that fits the requested K/V bits
+    (defaulting to K=3, V=3 — the README quick-start recipe — when no
+    bits are specified). Explicit `kv_cache_dtype` values are never
+    overwritten."""
+    # Skip if user already pinned a cache dtype (any non-"auto" string).
+    for attr in ("kv_cache_dtype", "cache_dtype"):
+        v = getattr(engine_args, attr, None)
+        if isinstance(v, str) and v and v != "auto":
+            return
+
+    extra = getattr(engine_args, "additional_config", None) or {}
+    tq = extra.get("turboquant") if isinstance(extra, dict) else None
+    tq = tq if isinstance(tq, dict) else {}
+
+    backend = getattr(engine_args, "attention_backend", None)
+    if isinstance(backend, str):
+        backend_str = backend
+    elif backend is None:
+        backend_str = ""
+    else:
+        backend_str = getattr(backend, "name", str(backend))
+    is_tq_backend = backend_str.upper() == "TURBOQUANT"
+    bits_specified = "key_bits" in tq or "value_bits" in tq
+
+    if not (is_tq_backend or bits_specified):
+        return
+
+    try:
+        k_bits = int(tq.get("key_bits", 3))
+        v_bits = int(tq.get("value_bits", 3))
+    except (TypeError, ValueError):
+        return
+    if not (1 <= k_bits <= 4 and 1 <= v_bits <= 4):
+        return
+
+    host = _ft_pick_host_preset(k_bits, v_bits)
+    for attr in ("kv_cache_dtype", "cache_dtype"):
+        if hasattr(engine_args, attr):
+            setattr(engine_args, attr, host)
+    logger.info(
+        "fused-turboquant: kv_cache_dtype not set — auto-picked host %s "
+        "(K=%d, V=%d) from additional_config['turboquant'] / attention_backend",
+        host, k_bits, v_bits,
+    )
+
+
 def _ft_remap_kv_cache_dtype(value):
     """If `value` is one of our extended `turboquant_k{K}v{V}_nc` aliases,
     pick the smallest stock TurboQuant preset whose K/V slots are wide
@@ -390,16 +455,7 @@ def _ft_remap_kv_cache_dtype(value):
     if not m:
         return value
     k_bits, v_bits = int(m.group(1)), int(m.group(2))
-    # Smallest stock preset whose K/V slots fit. Stock presets:
-    #   turboquant_3bit_nc  → K slot = 3, V slot = 3
-    #   turboquant_k3v4_nc  → K slot = 3, V slot = 4
-    #   turboquant_4bit_nc  → K slot = 4, V slot = 4
-    if k_bits <= 3 and v_bits <= 3:
-        host = "turboquant_3bit_nc"
-    elif k_bits <= 3 and v_bits <= 4:
-        host = "turboquant_k3v4_nc"
-    else:
-        host = "turboquant_4bit_nc"
+    host = _ft_pick_host_preset(k_bits, v_bits)
     # Set env vars so v1_backend.py picks them up via the existing
     # TURBOQUANT_KEY_BITS / _VALUE_BITS override path. Don't clobber a
     # value the user already set explicitly.
@@ -439,6 +495,12 @@ def _patch_extend_tq_presets() -> None:
     original = EngineArgs.__post_init__
 
     def patched(self):
+        # Auto-pick a TurboQuant host preset for kv_cache_dtype when the
+        # user signals TQ intent (attention_backend="TURBOQUANT" or
+        # additional_config["turboquant"]["key_bits"|"value_bits"] set)
+        # but left kv_cache_dtype at the default. Does nothing if the
+        # user already pinned a non-"auto" cache dtype.
+        _ft_auto_fill_kv_cache_dtype(self)
         # Rewrite kv_cache_dtype on the EngineArgs object before its
         # CacheConfig is constructed. Both attribute names that have
         # been used historically are covered.

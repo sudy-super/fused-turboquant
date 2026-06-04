@@ -114,6 +114,51 @@ def _env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _env_int_in_range(name: str, lo: int, hi: int) -> Optional[int]:
+    """Parse an int env var, returning None if unset or out of [lo, hi]."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        v = int(raw)
+    except ValueError:
+        return None
+    return v if lo <= v <= hi else None
+
+
+def _ft_effective_tq_slot_bytes(preset_cfg, head_size: int) -> int:
+    """Minimum bytes per (slot, head) for the effective K/V bit widths
+    actually used by the store / decode kernels.
+
+    The store kernel writes (from `triton_inkernel_store`):
+        [K MSE indices: ceil(eff_K * head_dim / 8) bytes]
+        [K norm fp16:   2 bytes]
+        [V data:        ceil(eff_V * head_dim / 8) bytes]
+        [V scale+zero:  4 bytes]   (or V norm + pad in V_LLOYD_MAX mode)
+
+    `eff_K` / `eff_V` come from `TURBOQUANT_KEY_BITS` /
+    `TURBOQUANT_VALUE_BITS` (set by `additional_config["turboquant"]` or
+    the `turboquant_k{K}v{V}_nc` alias remap), falling back to the
+    preset's own slot bit widths. Values out-of-range or exceeding the
+    preset are clamped to the preset width — the v1 Impl init raises
+    `ValueError` separately on truly invalid overrides, but the cache
+    is already allocated by then so the clamp guards against undersized
+    slots in the error path.
+
+    FP8 keys (`preset_cfg.key_fp8 = True`) use a different layout
+    (1 byte per element, no norm); we defer to the preset's own
+    `slot_size_aligned` in that branch to keep the layout invariant."""
+    if getattr(preset_cfg, "key_fp8", False):
+        return preset_cfg.slot_size_aligned
+    preset_k = preset_cfg.key_quant_bits
+    preset_v = preset_cfg.value_quant_bits
+    eff_k = _env_int_in_range("TURBOQUANT_KEY_BITS", 1, preset_k) or preset_k
+    eff_v = _env_int_in_range("TURBOQUANT_VALUE_BITS", 1, preset_v) or preset_v
+    k_bytes = (eff_k * head_size + 7) // 8
+    v_bytes = (eff_v * head_size + 7) // 8
+    return k_bytes + 2 + v_bytes + 4
+
+
 # ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
@@ -179,12 +224,23 @@ class FusedTurboQuantV1Backend(AttentionBackend):
         when boundary protection is enabled:
 
           - TQ spec (dtype=uint8): need slot >= TQ slot bytes
-            (`slot_size_aligned`).
+            (computed from the *effective* K/V bit widths actually used
+            by the store / decode kernels — see
+            `_ft_effective_tq_slot_bytes`. This is tighter than the
+            preset's `slot_size_aligned` whenever
+            `TURBOQUANT_KEY_BITS` / `TURBOQUANT_VALUE_BITS` are set to
+            sub-preset values, which is how `additional_config["turboquant"]`
+            and the `turboquant_k{K}v{V}_nc` alias remap reduce real
+            memory consumption, not just quantization error).
           - Auto spec (dtype=bf16): need slot >= 2 * head_size
             (i.e. `4*head_size` bytes / 2 bytes-per-element).
 
-        When boundary protection is disabled, only the TQ requirement
-        applies and the slot can be smaller (saving memory).
+        When boundary protection is disabled the TQ requirement is the
+        only constraint — that's the regime where lowering `key_bits` /
+        `value_bits` actually shrinks the paged cache (after the
+        power-of-2 ceiling). With boundary protection at `fp16`, the
+        raw-fp16 boundary spec dominates and the savings are absorbed
+        by the page-size unification shim.
         """
         from fused_turboquant.vllm_plugin.plugin import _boundary_protect_enabled
 
@@ -194,9 +250,10 @@ class FusedTurboQuantV1Backend(AttentionBackend):
                 TurboQuantConfig,
             )
 
-            tq_raw = TurboQuantConfig.from_cache_dtype(
+            preset_cfg = TurboQuantConfig.from_cache_dtype(
                 cache_dtype_str, head_size
-            ).slot_size_aligned
+            )
+            tq_raw = _ft_effective_tq_slot_bytes(preset_cfg, head_size)
             raw = (
                 max(tq_raw, raw_fp16_elems)
                 if _boundary_protect_enabled()
