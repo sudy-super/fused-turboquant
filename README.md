@@ -1,5 +1,15 @@
 # fused-turboquant
 
+KとVに独立のbit数を指定可能な改良TurboQuantとその発展手法のfused kernelの実装です。
+
+このレポジトリには
+
+- KとVに1 - 4 bitの独立なbit数を指定可能
+- そこそこfusedなカーネル
+- Valueも回転させることによって改善した量子化性能
+
+を備えたTurboQuantのvllmプラグインと、RotorQuant, IsoQuant-Full / Fast, PlanarQuantのそこそこfusedなカーネルがあります。
+
 **fused-turboquant** is a high-performance Python library for compressing LLM KV caches to 2-4 bits using the TurboQuant algorithm (Google Research, ICLR 2026). It fuses the entire quantization pipeline — Randomized Hadamard Transform, normalization, Lloyd-Max quantization, and bit packing — into single Triton GPU kernels, achieving up to 4.9x memory compression with near-lossless quality. Drop-in support for HuggingFace Transformers and vLLM. Works with Llama, Qwen, Mistral, Phi, and more.
 
 - 🗜️ Compresses both **K and V** caches to **2-4 bits** using [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026) — up to **~4.9x KV cache compression** (3-bit) or **~3.8x** (4-bit)
@@ -7,8 +17,6 @@
 - 🦋 Uses **RHT** instead of dense QR rotation — O(d log d) compute, O(d) storage, fits in registers
 - 🤗 Drop-in **HuggingFace** integration and **vLLM** attention backend
 - 🔄 Auto-detects CUDA + Triton; falls back to unfused PyTorch on CPU
-
-KとVを1 - 4のbit数で独立して量子化できるようにしたTurboQuantとその他改良手法のvllm pluginです。
 
 ## 依存関係インストール
 
@@ -36,7 +44,7 @@ pip install -e ".[dev]"   # 開発依存も含めて editable install
 ### HuggingFace Transformers
 
 `patch_model` がモデルの全 attention 層に圧縮 KV キャッシュを差し込みます。RoPE / GQA は自動検出されます。
-vllmよりは最適化が甘いです。
+vllmプラグインに比べると最適化が甘いです。
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -61,7 +69,7 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))
 ```
 
 オプション (`patch_model` 引数):
-- `bits=3`: K, Vを3-bit量子化
+- `bits=3`: KとVを3-bit量子化
 - `compress_v=False`: K のみ圧縮 (V は FP16)
 - `compress_v="boundary"`: 最初と最後の 2 層を FP16 のまま
 - `quantizer_kind="planar"` / `"rotor"` / `"iso_fast"` / `"iso_full"`: ブロック対角型回転 (デフォルト `"rht"`)
