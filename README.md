@@ -74,7 +74,7 @@ print(tokenizer.decode(out[0], skip_special_tokens=True))
 - `compress_v="boundary"`: 最初と最後の 2 層を FP16 のまま
 - `quantizer_kind="planar"` / `"rotor"` / `"iso_fast"` / `"iso_full"`: ブロック対角型回転 (デフォルト `"rht"`)
 
-### 🔌 vLLM
+### vLLM
 
 ハイパラは Gemma 4 31B Instruct での 300 サンプル GSM-8K 評価で精度劣化 −0.34 pts (97.67% → 97.33%)、 KV cache 9.7× 圧縮を達成した構成 (rht + BP=0 + V_ROTATE + K3V3):
 
